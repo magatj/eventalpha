@@ -261,10 +261,10 @@ resource "aws_lb_listener" "https" {
 
 # --- services ----------------------------------------------------------------------
 resource "aws_ecs_service" "api" {
-  name                               = "api"
-  cluster                            = aws_ecs_cluster.this.id
-  task_definition                    = aws_ecs_task_definition.api.arn
-  desired_count                      = var.api_desired_count
+  name            = "api"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = var.api_desired_count
   capacity_provider_strategy {
     capacity_provider = var.use_fargate_spot ? "FARGATE_SPOT" : "FARGATE"
     weight            = 1
