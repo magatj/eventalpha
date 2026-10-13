@@ -50,6 +50,7 @@ def claim_next(session: Session, worker_id: str) -> AnalysisJob | None:
         return None
     job.status = "running"
     job.started_at = datetime.now(UTC)
+    job.heartbeat_at = job.started_at
     job.locked_by = worker_id
     job.attempts += 1
     session.flush()
@@ -72,13 +73,36 @@ def set_progress(session: Session, job_id: uuid.UUID, msg: str) -> None:
     session.execute(update(AnalysisJob).where(AnalysisJob.id == job_id).values(progress=msg[:250]))
 
 
-def recover_stale(session: Session, older_than: timedelta = timedelta(minutes=45)) -> int:
-    """Jobs left 'running' by a crashed worker are failed (not silently retried)."""
-    cutoff = datetime.now(UTC) - older_than
+HEARTBEAT_INTERVAL = timedelta(seconds=30)
+STALE_AFTER = timedelta(minutes=3)
+
+
+def heartbeat(session: Session, job_id: uuid.UUID) -> None:
+    session.execute(update(AnalysisJob).where(AnalysisJob.id == job_id, AnalysisJob.status == "running")
+                    .values(heartbeat_at=datetime.now(UTC)))
+
+
+def recover_stale(session: Session, older_than: timedelta = STALE_AFTER) -> int:
+    """Fail 'running' jobs whose worker stopped heartbeating (crash, restart, container replaced).
+
+    They are failed, not silently retried, and their dedupe key is released so the job can be
+    started again. Discovery runs left 'running' by such a job are marked failed too."""
+    from sqlalchemy import func
+
+    from app.models import DiscoveryRun
+
+    now = datetime.now(UTC)
+    last_seen = func.coalesce(AnalysisJob.heartbeat_at, AnalysisJob.started_at)
     stale = list(session.scalars(select(AnalysisJob).where(AnalysisJob.status == "running",
-                                                           AnalysisJob.started_at < cutoff)))
+                                                           last_seen < now - older_than)))
     for j in stale:
-        j.status, j.error, j.finished_at = "failed", "worker stopped before completion", datetime.now(UTC)
+        j.status, j.finished_at = "failed", now
+        j.error = f"worker {j.locked_by or ''} stopped before completion (no heartbeat); safe to re-run".strip()
         if not (j.payload or {}).get("_keep_dedupe"):
             j.dedupe_key = None
+        if j.job_type == "discovery":
+            for run in session.scalars(select(DiscoveryRun).where(DiscoveryRun.status == "running",
+                                                                  DiscoveryRun.data_mode == j.data_mode,
+                                                                  DiscoveryRun.started_at <= now)):
+                run.status, run.finished_at = "failed", now
     return len(stale)

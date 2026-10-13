@@ -11,6 +11,7 @@ import os
 import signal
 import socket
 import threading
+import time
 import traceback
 
 from app.config import get_settings
@@ -36,6 +37,18 @@ def run_one(worker_id: str) -> bool:
         with session_scope() as ps:
             jobs.set_progress(ps, job_id, msg)
 
+    # Heartbeat in a side thread so long jobs (e.g. rate-limited discovery) stay visibly alive.
+    done = threading.Event()
+
+    def beat() -> None:
+        while not done.wait(jobs.HEARTBEAT_INTERVAL.total_seconds()):
+            try:
+                with session_scope() as hs:
+                    jobs.heartbeat(hs, job_id)
+            except Exception:
+                log.warning("heartbeat failed for job %s", job_id, exc_info=True)
+
+    threading.Thread(target=beat, daemon=True, name=f"heartbeat-{job_id}").start()
     try:
         with session_scope() as s:
             job = s.get(jobs.AnalysisJob, job_id)
@@ -54,18 +67,23 @@ def run_one(worker_id: str) -> bool:
         with session_scope() as s:
             jobs.finish(s, job_id, False, error=f"{type(exc).__name__}: {exc}")
         log.error("job %s crashed:\n%s", job_id, traceback.format_exc())
+    finally:
+        done.set()
     return True
 
 
 def loop(stop: threading.Event, worker_id: str | None = None) -> None:
     worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
     poll = get_settings().worker_poll_seconds
-    with session_scope() as s:
-        n = jobs.recover_stale(s)
-        if n:
-            log.warning("marked %d stale running job(s) as failed", n)
+    last_recovery = 0.0
     while not stop.is_set():
         try:
+            if time.monotonic() - last_recovery > 60:  # also catches jobs orphaned by other workers
+                last_recovery = time.monotonic()
+                with session_scope() as s:
+                    n = jobs.recover_stale(s)
+                if n:
+                    log.warning("marked %d orphaned running job(s) as failed", n)
             if not run_one(worker_id):
                 stop.wait(poll)
         except Exception:

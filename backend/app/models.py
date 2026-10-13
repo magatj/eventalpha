@@ -362,6 +362,7 @@ class AnalysisJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(TS)
     finished_at: Mapped[datetime | None] = mapped_column(TS)
     locked_by: Mapped[str | None] = mapped_column(String(64))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(TS)  # refreshed by the worker while running
 
 
 class ProviderSyncHistory(Base):

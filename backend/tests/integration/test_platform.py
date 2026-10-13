@@ -248,3 +248,32 @@ def test_demo_reset_removes_only_demo(client, run_jobs, engine):
         assert c.execute(text("SELECT count(*) FROM companies WHERE data_mode='demo'")).scalar() == 0
         assert c.execute(text("SELECT count(*) FROM forecasts WHERE data_mode='demo'")).scalar() == 0
         assert c.execute(text("SELECT count(*) FROM companies WHERE data_mode='live'")).scalar() >= 1  # untouched
+
+
+def test_orphaned_running_job_is_recovered(engine):
+    """A worker that dies mid-job (e.g. container replaced) must not leave the job 'running'
+    forever, and the job's dedupe key must be released so it can be started again."""
+    from datetime import UTC
+
+    from app.models import AnalysisJob, DiscoveryRun
+    from app.services import jobs
+
+    with session_scope() as s:
+        s.execute(text("DELETE FROM analysis_jobs WHERE dedupe_key = 'discovery-manual:live'"))
+        job, _ = jobs.enqueue(s, "discovery", "live", dedupe_key="discovery-manual:live")
+        claimed = jobs.claim_next(s, "dead-worker:1")
+        assert claimed.id == job.id
+        s.add(DiscoveryRun(data_mode="live", status="running"))
+        s.flush()
+        jobs.heartbeat(s, job.id)
+        assert jobs.recover_stale(s) == 0  # fresh heartbeat: still considered alive
+        s.get(AnalysisJob, job.id).heartbeat_at = datetime.now(UTC) - timedelta(minutes=10)
+        s.flush()
+        assert jobs.recover_stale(s) >= 1
+        j = s.get(AnalysisJob, job.id)
+        assert j.status == "failed" and "no heartbeat" in j.error and j.dedupe_key is None
+        assert s.scalar(select(DiscoveryRun.status).where(DiscoveryRun.data_mode == "live")
+                        .order_by(DiscoveryRun.id.desc())) == "failed"
+        _, created = jobs.enqueue(s, "discovery", "live", dedupe_key="discovery-manual:live")
+        assert created  # can be re-run
+        s.execute(text("DELETE FROM analysis_jobs WHERE job_type = 'discovery' AND data_mode = 'live'"))
