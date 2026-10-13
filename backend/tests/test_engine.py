@@ -193,3 +193,11 @@ def test_sector_mapping(sic, expected):
 
 def test_semiconductor_description_maps_to_technology():
     assert sector_from_sic("3674", "Semiconductors & Related Devices") == "Technology"
+
+
+def test_implausible_valuation_is_withheld_not_shown():
+    """Bad source units (e.g. shares in millions) must never surface as a $169M target."""
+    h = ForecastEngine(inputs(shares=500.0, eps_ttm=4e6)).run(12)
+    assert all(s.target_price is None and s.potential_return is None for s in h.scenarios.values())
+    assert any("Implausible valuation" in w for w in h.warnings)
+    assert h.scenarios["base"].details["withheld_target"] > 1e6

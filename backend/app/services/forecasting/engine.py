@@ -34,7 +34,8 @@ DCF_YEARS = 5
 METHOD_WEIGHTS = {"forward_pe": 0.6, "dcf": 0.4}
 MIN_EARNINGS_MARGIN = 0.02  # below this net margin, earnings multiples are not meaningful
 WACC_BOUNDS = (0.075, 0.16)
-MIN_PE, MAX_PE = 5.0, 80.0  # bounds applied to company-specific historical multiples
+MIN_PE, MAX_PE = 5.0, 80.0
+MIN_PLAUSIBLE_RATIO, MAX_PLAUSIBLE_RATIO = 0.05, 10.0  # base target / price outside this => data error  # bounds applied to company-specific historical multiples
 MAX_COMPANY_PE_MEDIAN = 100.0  # above this, history reflects depressed earnings, not valuation
 
 
@@ -505,6 +506,17 @@ class ForecastEngine:
         years = horizon_months / 12
         scenarios = {sc: self._scenario(sc, years) for sc in SCENARIOS}
         warnings = list(self.warnings)
+        base_t = scenarios["base"].target_price
+        if base_t is not None and not (MIN_PLAUSIBLE_RATIO <= base_t / i.price <= MAX_PLAUSIBLE_RATIO):
+            # A fundamental value 10x above (or 95% below) the market price almost always means bad
+            # input data (units, share counts), not an opportunity. Withhold rather than mislead.
+            warnings.append(
+                f"Implausible valuation (base target {base_t / i.price:,.1f}× the current price) — likely a "
+                "data error in the source filings; price targets withheld.")
+            for s in scenarios.values():
+                s.details["withheld_target"] = s.target_price
+                s.target_price = s.target_price_pe = s.target_price_dcf = s.target_price_ev_sales = None
+                s.potential_return = None
         t = [scenarios[s].target_price for s in SCENARIOS]
         if all(x is not None for x in t) and not (t[0] <= t[1] <= t[2]):  # type: ignore[operator]
             warnings.append("Scenario targets are not monotonic (bear ≤ base ≤ bull); methods disagree.")

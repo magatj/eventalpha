@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any
@@ -137,6 +138,42 @@ def _safe_div(a: float | None, b: float | None) -> float | None:
     return a / b
 
 
+STALE_INSTANT_DAYS = 400
+SHARE_SCALES = (1.0, 1e3, 1e6)
+
+
+def _fix_share_scale(snap: FinancialSnapshot) -> None:
+    """Some filers tag share counts in thousands/millions while declaring the unit 'shares'
+    (e.g. McDonald's reports 711.1 meaning 711.1 million). Detect the scale by comparing with
+    the cover-page share count, or else net income / reported EPS, and rescale the series."""
+    series = [s for s in (snap.quarterly.get("diluted_shares"), snap.annual.get("diluted_shares")) if s]
+    if not series:
+        return
+    latest = series[0][-1].value
+    reference: float | None = None
+    basis = ""
+    so = snap.instant.get("shares_outstanding")
+    if so and so.value > 0:
+        reference, basis = so.value, "cover-page shares outstanding"
+    else:
+        ni = {p.period_end: p.value for p in snap.annual.get("net_income", [])}
+        for p in reversed(snap.annual.get("eps_diluted", [])):
+            if p.period_end in ni and p.value and abs(p.value) > 0.01:
+                reference, basis = ni[p.period_end] / p.value, "net income / diluted EPS"
+                break
+    if not reference or latest <= 0 or reference <= 0:
+        return
+    best = min(SHARE_SCALES, key=lambda f: abs(math.log(latest * f / reference)))
+    if best == 1.0 or not 0.5 <= latest * best / reference <= 2.0:
+        return
+    for s in series:
+        for i, p in enumerate(s):
+            s[i] = PeriodValue(p.period_start, p.period_end, p.value * best, p.fiscal_year, p.fiscal_period,
+                               p.accession, p.filed_date, p.derived, p.concept)
+    snap.warnings.append(
+        f"Diluted share counts were tagged in units of {int(best):,} by the filer; rescaled using {basis}.")
+
+
 def build_snapshot(facts: list[FinancialFact], as_of: date | None = None, currency: str = "USD") -> FinancialSnapshot:
     """Build the snapshot using only facts filed on/before `as_of` (point-in-time)."""
     as_of = as_of or date.today()
@@ -166,6 +203,17 @@ def build_snapshot(facts: list[FinancialFact], as_of: date | None = None, curren
             snap.annual[metric] = series
         elif series:
             snap.instant[metric] = series[-1]
+
+    # Balance-sheet items must come from (roughly) the latest balance sheet: a concept a company
+    # stopped tagging years ago (e.g. short-term investments last reported in 2014) is dropped.
+    if snap.instant:
+        latest_bs = max(v.period_end for v in snap.instant.values())
+        for metric in [m for m, v in snap.instant.items() if (latest_bs - v.period_end).days > STALE_INSTANT_DAYS]:
+            snap.warnings.append(
+                f"Ignored stale balance-sheet item '{metric}' (last reported {snap.instant[metric].period_end}).")
+            del snap.instant[metric]
+
+    _fix_share_scale(snap)
 
     annual_forms = [f for f in known if f.period_type == "annual" and f.metric == "revenue" and f.form]
     if annual_forms and max(annual_forms, key=lambda f: f.filed_date).form.startswith(("20-F", "40-F")):

@@ -165,3 +165,41 @@ def test_recorded_nvidia_fiscal_quarters(fixture):
     labels = {(p.period_end, p.fiscal_year, p.fiscal_period) for p in s.quarterly["revenue"]}
     assert (date(2026, 4, 26), 2027, "Q1") in labels
     assert (date(2026, 1, 25), 2026, "Q4") in labels
+
+
+def _mcd_like(cover_shares: bool = True):
+    """Filer tags diluted shares as 711.1 'shares' (meaning millions) — the McDonald's case."""
+    shares = [f("2025-01-01", "2025-12-31", 716.4, "M1", "10-K", "2026-02-20", 2025, "FY")]
+    us = {
+        "Revenues": {"units": {"USD": [f("2025-01-01", "2025-12-31", 26.885e9, "M1", "10-K", "2026-02-20", 2025, "FY")]}},
+        "NetIncomeLoss": {"units": {"USD": [f("2025-01-01", "2025-12-31", 8.563e9, "M1", "10-K", "2026-02-20", 2025, "FY")]}},
+        "EarningsPerShareDiluted": {"units": {"USD/shares": [f("2025-01-01", "2025-12-31", 11.95, "M1", "10-K", "2026-02-20", 2025, "FY")]}},
+        "WeightedAverageNumberOfDilutedSharesOutstanding": {"units": {"shares": shares}},
+        "CashAndCashEquivalentsAtCarryingValue": {"units": {"USD": [f(None, "2025-12-31", 1.1e9, "M1", "10-K", "2026-02-20", 2025, "FY")]}},
+        "ShortTermInvestments": {"units": {"USD": [f(None, "2014-09-30", 4.075e8, "OLD", "10-Q", "2014-11-01", 2014, "Q3")]}},
+    }
+    cf = {"facts": {"us-gaap": us}}
+    if cover_shares:
+        cf["facts"]["dei"] = {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            f(None, "2025-12-31", 713_000_000, "M1", "10-K", "2026-02-20", 2025, "FY")]}}}
+    return cf
+
+
+@pytest.mark.parametrize("cover_shares", [True, False])
+def test_share_counts_tagged_in_millions_are_rescaled(cover_shares):
+    s = build_snapshot(normalize_companyfacts(_mcd_like(cover_shares)), as_of=date(2026, 3, 1))
+    assert s.ttm["diluted_shares"] == pytest.approx(716.4e6)
+    assert s.ttm["eps"] == pytest.approx(8.563e9 / 716.4e6)  # ~11.95, not ~12 million
+    assert any("units of 1,000,000" in w for w in s.warnings)
+
+
+def test_correct_share_counts_are_not_rescaled():
+    s = build_snapshot(normalize_companyfacts(companyfacts()), as_of=date(2025, 3, 1))
+    assert not any("rescaled" in w for w in s.warnings)
+
+
+def test_stale_balance_sheet_items_are_ignored():
+    s = build_snapshot(normalize_companyfacts(_mcd_like()), as_of=date(2026, 3, 1))
+    assert "short_term_investments" not in s.instant  # last tagged in 2014
+    assert s.ttm["cash_and_investments"] == pytest.approx(1.1e9)
+    assert any("stale balance-sheet item 'short_term_investments'" in w for w in s.warnings)
