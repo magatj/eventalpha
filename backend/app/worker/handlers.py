@@ -14,12 +14,14 @@ from app.config import get_settings
 from app.models import AnalysisJob, Event, HttpCache
 from app.services.ai import AIEngine
 from app.services.analysis import analyze_ticker
-from app.services.discovery import ingest_universe_news, run_discovery
+from app.services.baseline import refresh_baseline
+from app.services.discovery import run_discovery
 from app.services.http import ProviderError, ProviderNotConfigured
 from app.services.market_calendar import last_completed_session
 from app.services.prices import upsert_prices
 from app.services.providers import market_provider
 from app.services.universe import ensure_universe_companies, universe_tickers, watchlist_tickers
+from app.services.universe_news import ingest_universe_filings, ingest_universe_news
 
 log = logging.getLogger(__name__)
 Progress = Callable[[str], None]
@@ -32,10 +34,19 @@ def h_analyze(session: Session, job: AnalysisJob, progress: Progress) -> dict[st
     return {"analysis_id": out.analysis_id, "cached": out.cached, "ticker": p["ticker"].upper(), "warnings": out.warnings}
 
 
+def _universe(session: Session, mode: str):
+    tickers = list(dict.fromkeys(universe_tickers(mode) + watchlist_tickers(session, mode)))
+    return ensure_universe_companies(session, mode, tickers)
+
+
 def h_ingest_news(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
-    tickers = list(dict.fromkeys(universe_tickers(job.data_mode) + watchlist_tickers(session, job.data_mode)))
-    companies = ensure_universe_companies(session, job.data_mode, tickers)
-    return ingest_universe_news(session, job.data_mode, companies)
+    """Company news for the whole universe (market-wide feed + rotating per-ticker checks) + macro RSS."""
+    return ingest_universe_news(session, job.data_mode, _universe(session, job.data_mode), progress=progress)
+
+
+def h_refresh_baseline(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
+    """Prices, liquidity and SEC financials for every universe stock (pre-selection baseline)."""
+    return refresh_baseline(session, job.data_mode, _universe(session, job.data_mode), progress)
 
 
 def h_refresh_prices(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
@@ -62,19 +73,8 @@ def h_refresh_prices(session: Session, job: AnalysisJob, progress: Progress) -> 
 
 
 def h_sec_monitor(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
-    from app.services.events import ingest_articles
-    from app.services.providers import news_provider
-
-    tickers = list(dict.fromkeys(watchlist_tickers(session, job.data_mode) + universe_tickers(job.data_mode)[:40]))
-    companies = ensure_universe_companies(session, job.data_mode, tickers)
-    prov = news_provider(job.data_mode, tickers)
-    total: dict[str, int] = {}
-    for t in tickers:
-        progress(f"SEC filings {t}")
-        stats = ingest_articles(session, job.data_mode, prov.fetch_sec_filings(t), {t: companies[t]})
-        for k, v in stats.items():
-            total[k] = total.get(k, 0) + v
-    return total
+    """SEC filings + estimated earnings dates for every universe company."""
+    return ingest_universe_filings(session, job.data_mode, _universe(session, job.data_mode), progress=progress)
 
 
 def h_catalyst_analysis(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
@@ -141,6 +141,7 @@ def h_cache_cleanup(session: Session, job: AnalysisJob, progress: Progress) -> d
 HANDLERS: dict[str, Callable[[Session, AnalysisJob, Progress], dict[str, Any]]] = {
     "analyze_ticker": h_analyze,
     "ingest_news": h_ingest_news,
+    "refresh_baseline": h_refresh_baseline,
     "refresh_prices": h_refresh_prices,
     "sec_monitor": h_sec_monitor,
     "catalyst_analysis": h_catalyst_analysis,

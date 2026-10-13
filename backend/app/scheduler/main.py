@@ -64,6 +64,8 @@ def build_scheduler() -> BackgroundScheduler:
                   args=["refresh_prices", "day", True], id="refresh_prices")
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour="7-20/2", minute=10),
                   args=["sec_monitor", "2hour"], id="sec_monitor")
+    sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour=17, minute=5),
+                  args=["refresh_baseline", "day", True], id="refresh_baseline")
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour=17, minute=30),
                   args=["catalyst_analysis", "day", True], id="catalyst_analysis")
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour=18, minute=0),

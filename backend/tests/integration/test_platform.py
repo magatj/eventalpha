@@ -277,3 +277,37 @@ def test_orphaned_running_job_is_recovered(engine):
         _, created = jobs.enqueue(s, "discovery", "live", dedupe_key="discovery-manual:live")
         assert created  # can be re-run
         s.execute(text("DELETE FROM analysis_jobs WHERE job_type = 'discovery' AND data_mode = 'live'"))
+
+
+def test_discovery_selection_audit_and_unseen_stocks(client, run_jobs, monkeypatch):
+    """End-to-end: baseline for the whole universe, pathway-based selection, per-ticker audit,
+    and never-analyzed stocks entering the candidate list."""
+    from app.config import get_settings
+
+    s = get_settings()
+    for k, v in {"discovery_max_candidates": 10, "discovery_quota_baseline": 5, "discovery_quota_catalyst": 3,
+                 "discovery_quota_underexplored": 2, "discovery_top_n": 5}.items():
+        monkeypatch.setattr(s, k, v)
+    set_mode(client, "demo")
+    r = client.post("/api/discovery/run").json()
+    run_jobs(5)
+    assert client.get(f"/api/jobs/{r['job_id']}").json()["status"] == "succeeded"
+
+    audit = client.get("/api/discovery/candidates").json()
+    rows = audit["candidates"]
+    stats = audit["stats"]
+    assert stats["universe"] == len(rows) >= 22  # every universe stock audited, selected or not
+    selected = [c for c in rows if c["selected"]]
+    assert len(selected) == 10 and stats["selected"] == 10
+    assert {c["pathway"] for c in selected} <= {"baseline_leader", "new_catalyst", "underexplored", "refill"}
+    assert sum(1 for c in selected if c["pathway"] == "underexplored") == 2
+    assert any(not c["previously_analyzed"] for c in selected)  # unseen stocks get in
+    assert all(c["data_timestamps"]["price_date"] for c in selected)
+    assert {c["catalyst_status"] for c in rows} <= {"detected", "none_detected", "unknown"}
+    for c in rows:
+        if c["status"] in ("screened", "ranked"):
+            assert c["factors"]["score"] == c["score"] and "contributions" in c["factors"]
+        if c["status"] in ("excluded", "ineligible"):
+            assert c["exclusion_reason"]
+    items = client.get("/api/discovery").json()["items"]
+    assert items and all(i["selection_pathway"] for i in items)

@@ -89,6 +89,41 @@ export interface DiscoveryItem {
   catalyst: { title: string | null; event_id: number | null; event_date: string | null };
   analysis_at: string | null;
   ai_kind: string | null;
+  selection_pathway: string | null;
+}
+
+export interface DiscoveryStats {
+  universe: number;
+  eligible: number;
+  selected: number;
+  pathway_slots: Record<string, number>;
+  coverage: Record<string, number>;
+  selected_coverage: Record<string, number>;
+  previously_unanalyzed_selected: number;
+  previously_unanalyzed_ranked: number;
+  selected_sectors: Record<string, number>;
+  ranked_sectors: Record<string, number>;
+  selected_first_letter_span: string | null;
+  excluded: number;
+  ranked: number;
+}
+
+export interface CandidateRow {
+  ticker: string;
+  status: "ranked" | "screened" | "excluded" | "selected" | "not_selected" | "ineligible";
+  selected: boolean;
+  selection_order: number | null;
+  pathway: string | null;
+  qualifying_pathways: string[];
+  baseline_score: number | null;
+  catalyst_status: "detected" | "none_detected" | "unknown";
+  catalyst_score: number | null;
+  previously_analyzed: boolean;
+  last_analyzed_at: string | null;
+  data_timestamps: Record<string, string | null>;
+  score: number | null;
+  exclusion_reason: string | null;
+  final_rank: number | null;
 }
 
 export interface Job {
@@ -105,7 +140,16 @@ export interface Job {
 export interface Discovery {
   data_mode: DataMode;
   items: DiscoveryItem[];
-  run: null | { id: number; started_at: string; finished_at: string; universe_size: number; candidates_evaluated: number; notes: Record<string, unknown> };
+  run: null | {
+    id: number;
+    started_at: string;
+    finished_at: string;
+    universe_size: number;
+    candidates_evaluated: number;
+    notes: Record<string, unknown>;
+    stats: DiscoveryStats | null;
+    seed: string | null;
+  };
   running_job: Job | null;
   ranking_explanation?: string;
 }
@@ -324,6 +368,13 @@ export const useDiscovery = (params = "") =>
     queryKey: ["discovery", params],
     queryFn: () => api<Discovery>(`/api/discovery${params}`),
     refetchInterval: (q) => (q.state.data?.running_job ? 4000 : false),
+  });
+export const useDiscoveryCandidates = (enabled: boolean) =>
+  useQuery({
+    queryKey: ["discoveryCandidates"],
+    queryFn: () => api<{ run_id: number; seed: string; stats: DiscoveryStats; candidates: CandidateRow[] }>("/api/discovery/candidates"),
+    enabled,
+    retry: false,
   });
 export const useStock = (t: string) => useQuery({ queryKey: ["stock", t], queryFn: () => api<StockOverview>(`/api/stocks/${t}`), retry: false });
 export const usePrices = (t: string, range: string) =>

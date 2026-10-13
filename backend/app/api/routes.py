@@ -29,6 +29,7 @@ from app.models import (
     Analysis,
     AnalysisJob,
     Company,
+    DiscoveryCandidate,
     DiscoveryRun,
     Event,
     EventCompanyRelationship,
@@ -115,7 +116,7 @@ def discovery(
             "bull_target": next((s.target_price for s in f.scenarios if s.scenario == "bull"), None) if f else None,
             "catalyst": {"title": r.catalyst_title, "event_id": r.catalyst_event_id, "event_date": iso(r.catalyst_date)},
             "analysis_id": r.analysis_id, "analysis_at": iso(a.created_at) if a else None,
-            "ai_kind": a.ai_kind if a else None,
+            "ai_kind": a.ai_kind if a else None, "selection_pathway": r.selection_pathway,
         })
     if sector:
         items = [i for i in items if (i["sector"] or "").lower() == sector.lower()]
@@ -136,11 +137,38 @@ def discovery(
         "data_mode": mode, "items": items, "running_job": _job_dict(running) if running else None,
         "run": {"id": run.id, "started_at": iso(run.started_at), "finished_at": iso(run.finished_at),
                 "universe_size": run.universe_size, "candidates_evaluated": run.candidates_evaluated,
-                "config": run.config, "notes": run.notes},
+                "config": run.config, "notes": run.notes, "stats": run.stats, "seed": run.seed},
         "ranking_explanation": (
-            "Score = weighted sum of financial strength, catalyst materiality, valuation (base-case 12m return), "
-            "data freshness, minus forecast uncertainty and downside risk; rounded to 5 points. Upside alone does "
-            "not determine rank."),
+            "Candidates: 35 baseline leaders + 15 new catalysts + 10 underexplored stocks, chosen from baseline data "
+            "for the whole universe (ties rotate by a daily seed, never alphabetically). Score = 100 x (raw - worst) / "
+            "(best - worst) over known factors: financial strength 25%, catalyst 20%, valuation 25%, freshness 10%, "
+            "minus forecast uncertainty 10% and downside risk 10%; unknown factors are excluded, not zeroed. "
+            "Rounded to 5 points; upside alone does not determine rank."),
+    }
+
+
+@router.get("/discovery/candidates", tags=["discovery"], summary="Selection audit for a discovery run")
+def discovery_candidates(run_id: int | None = None, db: Session = Depends(get_db),
+                         mode: str = Depends(current_mode)) -> dict[str, Any]:
+    q = select(DiscoveryRun).where(DiscoveryRun.data_mode == mode)
+    run = db.get(DiscoveryRun, run_id) if run_id else db.scalar(
+        q.where(DiscoveryRun.status == "succeeded").order_by(DiscoveryRun.started_at.desc()))
+    if run is None or run.data_mode != mode:
+        raise api_error(404, "not_found", "No discovery run found")
+    rows = db.scalars(select(DiscoveryCandidate).where(DiscoveryCandidate.run_id == run.id)).all()
+    status_order = {"ranked": 0, "screened": 1, "excluded": 2, "selected": 3, "not_selected": 4, "ineligible": 5}
+    rows = sorted(rows, key=lambda r: (status_order.get(r.status, 9), r.final_rank or 999, r.selection_order or 999,
+                                       -(r.baseline_score or 0)))
+    return {
+        "data_mode": mode, "run_id": run.id, "seed": run.seed, "stats": run.stats, "config": run.config,
+        "candidates": [{
+            "ticker": r.ticker, "status": r.status, "selected": r.selected, "selection_order": r.selection_order,
+            "pathway": r.pathway, "qualifying_pathways": r.qualifying_pathways, "baseline_score": r.baseline_score,
+            "catalyst_status": r.catalyst_status, "catalyst_score": r.catalyst_score,
+            "previously_analyzed": r.previously_analyzed, "last_analyzed_at": iso(r.last_analyzed_at),
+            "data_timestamps": r.data_timestamps, "score": r.score, "factors": r.factors,
+            "exclusion_reason": r.exclusion_reason, "final_rank": r.final_rank, "tie_break_key": r.tie_break_key,
+        } for r in rows],
     }
 
 
@@ -297,11 +325,16 @@ def get_settings_route(db: Session = Depends(get_db), mode: str = Depends(curren
                         "risk_free_rate": s.risk_free_rate, "equity_risk_premium": s.equity_risk_premium,
                         "pre_tax_cost_of_debt": s.pre_tax_cost_of_debt, "tax_rate": s.tax_rate},
         "discovery": {"weights": RANKING_WEIGHTS, "top_n": s.discovery_top_n, "max_candidates": s.discovery_max_candidates,
-                      "ai_top_n": s.discovery_ai_top_n, "min_avg_dollar_volume": s.min_avg_dollar_volume},
+                      "ai_top_n": s.discovery_ai_top_n, "min_avg_dollar_volume": s.min_avg_dollar_volume,
+                      "quotas": {"baseline_leader": s.discovery_quota_baseline,
+                                 "new_catalyst": s.discovery_quota_catalyst,
+                                 "underexplored": s.discovery_quota_underexplored},
+                      "news_rotation_per_run": s.news_rotation_per_run},
         "scheduler": {"enabled": s.scheduler_enabled, "timezone": "America/New_York",
                       "jobs": [
                           {"id": "ingest_news", "schedule": f"every {s.news_ingest_interval_minutes} min"},
                           {"id": "refresh_prices", "schedule": "Mon–Fri 16:45 ET on NYSE sessions"},
+                          {"id": "refresh_baseline", "schedule": "Mon–Fri 17:05 ET on NYSE sessions"},
                           {"id": "sec_monitor", "schedule": "Mon–Fri every 2h 07:10–19:10 ET"},
                           {"id": "catalyst_analysis", "schedule": "Mon–Fri 17:30 ET on NYSE sessions"},
                           {"id": "discovery", "schedule": "Mon–Fri 18:00 ET on NYSE sessions"},

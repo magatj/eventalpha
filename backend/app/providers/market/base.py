@@ -104,6 +104,10 @@ class MarketDataProvider(abc.ABC):
     def get_company_news(self, ticker: str, limit: int = 20) -> list[ProviderArticle]:
         return []
 
+    def get_market_news(self, limit: int = 1000) -> list[ProviderArticle]:
+        """Most recent market-wide news (all tickers), newest first."""
+        return []
+
     def get_grouped_daily(self, day: date) -> dict[str, PriceBar]:
         """All tickers' bars for one session (used for cheap universe-wide refreshes)."""
         return {}

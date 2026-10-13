@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     discovery_top_n: int = 20
     discovery_max_candidates: int = 60
     discovery_ai_top_n: int = 10
+    discovery_quota_baseline: int = 35
+    discovery_quota_catalyst: int = 15
+    discovery_quota_underexplored: int = 10
+    news_rotation_per_run: int = 6  # per-ticker Massive news requests per ingestion run
     min_avg_dollar_volume: float = 20_000_000.0
 
     # Scheduler / worker

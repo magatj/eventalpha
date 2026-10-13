@@ -49,6 +49,23 @@ export function ReturnText({ value, className, digits = 1 }: { value: number | n
   );
 }
 
+const PATHWAY_LABEL: Record<string, [string, string]> = {
+  baseline_leader: ["Baseline leader", "Top baseline score (financial strength + data freshness) across the whole universe"],
+  new_catalyst: ["New catalyst", "Catalyst first detected since the previous discovery run"],
+  underexplored: ["Underexplored", "Never analyzed, or analyzed least recently"],
+  refill: ["Refill", "Filled an unused pathway slot from the baseline ranking"],
+};
+
+export function PathwayBadge({ pathway }: { pathway: string | null | undefined }) {
+  if (!pathway) return <span className="text-subtle">—</span>;
+  const [text, title] = PATHWAY_LABEL[pathway] ?? [pathway, ""];
+  return (
+    <Badge variant={pathway === "underexplored" ? "warn" : pathway === "new_catalyst" ? "accent" : "default"} title={title}>
+      {text}
+    </Badge>
+  );
+}
+
 export function OutlookBadge({ outlook }: { outlook: string | null | undefined }) {
   if (!outlook) return <span className="text-subtle">—</span>;
   const v = outlook === "bullish" ? "up" : outlook === "bearish" ? "down" : "default";

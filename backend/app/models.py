@@ -414,6 +414,8 @@ class DiscoveryRun(Base):
     candidates_evaluated: Mapped[int | None] = mapped_column(Integer)
     config: Mapped[Any | None] = mapped_column(JSONB)
     notes: Mapped[Any | None] = mapped_column(JSONB)
+    seed: Mapped[str | None] = mapped_column(String(32))  # tie-break rotation seed (reproducible)
+    stats: Mapped[Any | None] = mapped_column(JSONB)  # coverage / diversity summary
 
     recommendations: Mapped[list[Recommendation]] = relationship(order_by="Recommendation.rank")
 
@@ -437,6 +439,64 @@ class Recommendation(Base):
     catalyst_event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
     catalyst_title: Mapped[str | None] = mapped_column(Text)
     catalyst_date: Mapped[date | None] = mapped_column(Date)
+    selection_pathway: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
 
     company: Mapped[Company] = relationship()
+
+
+class CompanyBaseline(Base):
+    """Pre-selection snapshot for EVERY universe stock, refreshed independently of analysis, so
+    candidate selection never depends on which stocks happened to be analyzed before."""
+
+    __tablename__ = "company_baselines"
+
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"), primary_key=True)
+    data_mode: Mapped[str] = mapped_column(String(8), index=True)
+    price: Mapped[float | None] = mapped_column(Float)
+    price_date: Mapped[date | None] = mapped_column(Date)
+    avg_dollar_volume_20d: Mapped[float | None] = mapped_column(Float)
+    price_sessions: Mapped[int | None] = mapped_column(Integer)
+    metrics: Mapped[Any | None] = mapped_column(JSONB)  # revenue, growth, margins, net cash ...
+    financials_as_of: Mapped[date | None] = mapped_column(Date)  # latest SEC filing date used
+    financials_fetched_at: Mapped[datetime | None] = mapped_column(TS)
+    news_checked_at: Mapped[datetime | None] = mapped_column(TS)  # company-specific news coverage
+    news_window_start: Mapped[datetime | None] = mapped_column(TS)
+    ticker_news_checked_at: Mapped[datetime | None] = mapped_column(TS)  # per-ticker news rotation
+    filings_checked_at: Mapped[datetime | None] = mapped_column(TS)
+    eligible: Mapped[bool] = mapped_column(Boolean, default=False)
+    ineligible_reason: Mapped[str | None] = mapped_column(Text)
+    errors: Mapped[Any | None] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=utcnow, onupdate=utcnow)
+
+    company: Mapped[Company] = relationship()
+
+
+class DiscoveryCandidate(Base):
+    """One row per universe stock per discovery run: why it was (not) selected, through which
+    pathway(s), the data timestamps it was judged on, its score factors and exclusion reason."""
+
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (UniqueConstraint("run_id", "company_id", name="uq_candidate_run_company"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("discovery_runs.id", ondelete="CASCADE"), index=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"))
+    ticker: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16))  # ineligible | not_selected | excluded | screened | ranked
+    selected: Mapped[bool] = mapped_column(Boolean, default=False)
+    selection_order: Mapped[int | None] = mapped_column(Integer)
+    pathway: Mapped[str | None] = mapped_column(String(24))  # pathway that filled the slot
+    qualifying_pathways: Mapped[Any | None] = mapped_column(JSONB)  # every pathway it qualified for
+    baseline_score: Mapped[float | None] = mapped_column(Float)
+    catalyst_status: Mapped[str | None] = mapped_column(String(16))  # detected | none_detected | unknown
+    catalyst_score: Mapped[float | None] = mapped_column(Float)
+    previously_analyzed: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_analyzed_at: Mapped[datetime | None] = mapped_column(TS)
+    tie_break_key: Mapped[str | None] = mapped_column(String(16))
+    data_timestamps: Mapped[Any | None] = mapped_column(JSONB)
+    score: Mapped[float | None] = mapped_column(Float)
+    factors: Mapped[Any | None] = mapped_column(JSONB)
+    exclusion_reason: Mapped[str | None] = mapped_column(Text)
+    analysis_id: Mapped[int | None] = mapped_column(ForeignKey("analyses.id", ondelete="SET NULL"))
+    final_rank: Mapped[int | None] = mapped_column(Integer)

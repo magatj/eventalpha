@@ -63,6 +63,10 @@ def sector_from_sic(sic: str | int | None, description: str | None = None) -> st
         return "Communication Services"
     if 4900 <= s <= 4999:
         return "Utilities"
+    if s in (6324, 6411) and "insur" not in (description or "").lower():
+        return "Health Care"  # hospital & medical service plans (managed care, e.g. UNH)
+    if s == 7389:
+        return "Financials"  # in this universe: payment networks (V, MA, PYPL) — GICS Financials
     if s == 6798 or 6500 <= s <= 6553:
         return "Real Estate"
     if 6000 <= s <= 6799:

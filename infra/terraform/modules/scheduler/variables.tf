@@ -54,6 +54,7 @@ variable "schedules" {
   default = {
     ingest_news       = "rate(60 minutes)"
     refresh_prices    = "cron(45 16 ? * MON-FRI *)"
+    refresh_baseline  = "cron(5 17 ? * MON-FRI *)"
     sec_monitor       = "cron(10 7-19/2 ? * MON-FRI *)"
     catalyst_analysis = "cron(30 17 ? * MON-FRI *)"
     discovery         = "cron(0 18 ? * MON-FRI *)"

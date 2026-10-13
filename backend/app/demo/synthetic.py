@@ -154,6 +154,11 @@ class DemoMarketProvider(MarketDataProvider):
     def get_company_news(self, ticker: str, limit: int = 20) -> list[ProviderArticle]:
         return demo_articles(self.as_of, [ticker])[:limit]
 
+    def get_market_news(self, limit: int = 1000) -> list[ProviderArticle]:
+        # Deterministic subset: about half the demo universe has market-wide coverage.
+        covered = [t for t in DEMO_UNIVERSE if _seed(t, "mkt-news") % 2 == 0]
+        return demo_articles(self.as_of, covered)[:limit]
+
     def benchmark_series(self) -> list[PriceBar]:
         return self._series("SPY")
 

@@ -1,23 +1,32 @@
-"""Automated stock discovery: events → candidates → data → forecasts → explainable ranking.
+"""Automated stock discovery without selection bias.
 
-The score is a transparent weighted sum of bounded factors. It deliberately does NOT rank
-by projected upside alone, and it is reported in coarse 5-point steps with a band label to
-avoid false precision. Weights live in RANKING_WEIGHTS and are stored with every run.
+  1. Baseline   – prices, liquidity and SEC financials for EVERY universe stock (baseline.py)
+  2. Coverage   – market-wide + rotating company news and SEC filings for the whole universe
+                  (universe_news.py); missing coverage is "unknown", never "no catalyst"
+  3. Selection  – 60 candidates: 35 baseline leaders, 15 new catalysts, 10 underexplored,
+                  deduplicated and refilled; seeded tie-breaks, never alphabetical (selection.py)
+  4. Screening  – full quantitative analysis (no AI) + liquidity / data-validity / valuation checks
+  5. Scoring    – explicit six-factor 0–100 score (discovery_scoring.py)
+  6. AI         – only the top `discovery_ai_top_n` (default 10), then re-scored
+  7. Audit      – a DiscoveryCandidate row per universe stock: pathway(s), data timestamps,
+                  factors, score and exclusion reason
 """
 
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import DataMode, get_settings
 from app.models import (
     Analysis,
     Company,
+    DiscoveryCandidate,
     DiscoveryRun,
     Event,
     EventCompanyRelationship,
@@ -25,39 +34,31 @@ from app.models import (
     Recommendation,
 )
 from app.services.analysis import AnalysisError, analyze_ticker
-from app.services.events import ingest_articles, upsert_upcoming
+from app.services.baseline import get_baseline, refresh_baseline
+from app.services.discovery_scoring import (
+    FACTOR_WEIGHTS,
+    FORMULA,
+    CatalystStatus,
+    ScoreResult,
+    clamp01,
+    compute_score,
+    factor_values,
+    financial_strength,  # noqa: F401  (re-exported for callers/tests)
+)
 from app.services.http import ProviderError
-from app.services.providers import news_provider
+from app.services.market_calendar import NY
+from app.services.selection import (
+    UniverseItem,
+    catalyst_status,
+    select_candidates,
+)
 from app.services.universe import ensure_universe_companies, universe_tickers, watchlist_tickers
+from app.services.universe_news import ingest_universe_filings, ingest_universe_news
 
 log = logging.getLogger(__name__)
 
-RANKING_WEIGHTS: dict[str, float] = {
-    "financial_strength": 0.25,
-    "catalyst_materiality": 0.20,
-    "valuation": 0.25,
-    "data_freshness": 0.10,
-    "forecast_uncertainty": -0.10,
-    "downside_risk": -0.10,
-}
-
-
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
-
-
-def financial_strength(s: dict[str, Any]) -> float | None:
-    parts = []
-    if s.get("net_margin") is not None:
-        parts.append(clamp01(s["net_margin"] / 0.20))
-    if s.get("fcf_margin") is not None:
-        parts.append(clamp01(s["fcf_margin"] / 0.15))
-    if s.get("revenue_growth_yoy") is not None:
-        parts.append(clamp01((s["revenue_growth_yoy"] + 0.05) / 0.25))
-    nc, ni = s.get("net_cash"), s.get("revenue_ttm")
-    if nc is not None and ni:
-        parts.append(1.0 if nc >= 0 else clamp01(1 + nc / ni))  # net debt relative to revenue
-    return sum(parts) / len(parts) if parts else None
+RANKING_WEIGHTS = FACTOR_WEIGHTS  # backwards-compatible name used by the settings API
+NEW_CATALYST_FALLBACK_WINDOW = timedelta(hours=72)
 
 
 def catalyst_score(events: list[tuple[Event, EventCompanyRelationship]]) -> tuple[float, Event | None]:
@@ -73,35 +74,6 @@ def catalyst_score(events: list[tuple[Event, EventCompanyRelationship]]) -> tupl
     return clamp01(best), best_ev
 
 
-def score_candidate(snapshot: dict[str, Any], cat: float, filing_age_days: int | None) -> dict[str, Any]:
-    fs = financial_strength(snapshot)
-    base = snapshot.get("base_return_12m")
-    bear = snapshot.get("bear_return_12m")
-    bull = snapshot.get("bull_return_12m")
-    stale = snapshot.get("stale_sessions", 0) or 0
-    factors: dict[str, float | None] = {
-        "financial_strength": fs,
-        "catalyst_materiality": cat,
-        "valuation": clamp01((base + 0.10) / 0.50) if base is not None else None,
-        "data_freshness": (1.0 if stale == 0 else 0.7 if stale <= 2 else 0.3)
-        * (1.0 if filing_age_days is not None and filing_age_days <= 120 else 0.7),
-        "forecast_uncertainty": clamp01((bull - bear) / 1.5) if bull is not None and bear is not None else 0.5,
-        "downside_risk": clamp01(-bear / 0.6) if bear is not None else 0.5,
-    }
-    total = 0.0
-    contrib = {}
-    for k, w in RANKING_WEIGHTS.items():
-        v = factors[k] if factors[k] is not None else (0.0 if w > 0 else 0.5)
-        contrib[k] = round(w * v * 100, 1)
-        total += w * v
-    # theoretical range: all penalties maxed (-0.2) .. all positive factors maxed (+0.8)
-    raw = clamp01((total + 0.2) / 1.0) * 100
-    score = round(raw / 5) * 5
-    band = "Strong" if score >= 70 else "Moderate" if score >= 50 else "Weak"
-    return {"score": score, "band": band, "factors": {k: (round(v, 2) if v is not None else None) for k, v in factors.items()},
-            "contributions": contrib, "weights": RANKING_WEIGHTS}
-
-
 def company_events(session: Session, company_id: int) -> list[tuple[Event, EventCompanyRelationship]]:
     now = datetime.now(UTC)
     rows = session.execute(
@@ -114,109 +86,216 @@ def company_events(session: Session, company_id: int) -> list[tuple[Event, Event
     return [(r[0], r[1]) for r in rows]
 
 
-def ingest_universe_news(session: Session, mode: DataMode, companies: dict[str, Company]) -> dict:
-    prov = news_provider(mode, list(companies))
-    stats = ingest_articles(session, mode, prov.fetch_recent_news(), companies)
-    upsert_upcoming(session, mode, prov.fetch_upcoming_events([]), companies)
-    stats["errors"] = getattr(prov, "errors", [])[:10]
-    return stats
+def score_candidate(snapshot: dict[str, Any], cat: float | None, filing_age_days: int | None,
+                    status: CatalystStatus = "detected") -> dict[str, Any]:
+    """Score one screened candidate (see discovery_scoring for the exact formula)."""
+    return compute_score(factor_values(snapshot, status, cat, filing_age_days)).to_dict()
+
+
+def _last_analyzed(session: Session, mode: str) -> dict[int, datetime]:
+    return dict(session.execute(select(Analysis.company_id, func.max(Analysis.created_at))
+                                .where(Analysis.data_mode == mode).group_by(Analysis.company_id)).all())
+
+
+def build_universe_items(session: Session, mode: DataMode, companies: dict[str, Company],
+                         now: datetime) -> list[UniverseItem]:
+    last = _last_analyzed(session, mode)
+    items = []
+    for t, c in companies.items():
+        b = get_baseline(session, c)
+        evs = company_events(session, c.id)
+        cat, best_ev = catalyst_score(evs)
+        status = catalyst_status(bool(evs), b.news_checked_at, b.filings_checked_at, now)
+        m = b.metrics or {}
+        items.append(UniverseItem(
+            ticker=t, company_id=c.id, eligible=b.eligible, ineligible_reason=b.ineligible_reason,
+            baseline_score=m.get("baseline_score"), freshness=m.get("data_freshness"),
+            catalyst_status=status, catalyst_score=cat if status == "detected" else None,
+            catalyst_first_seen=max((e.created_at for e, _ in evs), default=None),
+            last_analyzed_at=last.get(c.id),
+            data_timestamps={
+                "price_date": b.price_date.isoformat() if b.price_date else None,
+                "financials_as_of": b.financials_as_of.isoformat() if b.financials_as_of else None,
+                "financials_fetched_at": b.financials_fetched_at.isoformat() if b.financials_fetched_at else None,
+                "news_checked_at": b.news_checked_at.isoformat() if b.news_checked_at else None,
+                "news_window_start": b.news_window_start.isoformat() if b.news_window_start else None,
+                "filings_checked_at": b.filings_checked_at.isoformat() if b.filings_checked_at else None,
+                "baseline_updated_at": b.updated_at.isoformat() if b.updated_at else None,
+            },
+        ))
+    return items
 
 
 def run_discovery(session: Session, mode: DataMode, progress=lambda m: None) -> DiscoveryRun:
     s = get_settings()
-    run = DiscoveryRun(data_mode=mode, config={"weights": RANKING_WEIGHTS, "top_n": s.discovery_top_n,
-                                               "max_candidates": s.discovery_max_candidates,
-                                               "ai_top_n": s.discovery_ai_top_n,
-                                               "min_avg_dollar_volume": s.min_avg_dollar_volume})
+    quotas = {"baseline_leader": s.discovery_quota_baseline, "new_catalyst": s.discovery_quota_catalyst,
+              "underexplored": s.discovery_quota_underexplored}
+    now = datetime.now(UTC)
+    seed = now.astimezone(NY).date().isoformat()  # one rotation per trading day, reproducible
+    prev = session.scalar(select(DiscoveryRun).where(DiscoveryRun.data_mode == mode, DiscoveryRun.status == "succeeded")
+                          .order_by(DiscoveryRun.started_at.desc()))
+    new_since = prev.started_at if prev else now - NEW_CATALYST_FALLBACK_WINDOW
+    run = DiscoveryRun(data_mode=mode, seed=seed, config={
+        "formula": FORMULA, "quotas": quotas, "total_candidates": s.discovery_max_candidates,
+        "top_n": s.discovery_top_n, "ai_top_n": s.discovery_ai_top_n,
+        "min_avg_dollar_volume": s.min_avg_dollar_volume, "new_catalyst_since": new_since.isoformat(),
+    })
     session.add(run)
-    session.flush()
-    notes: dict[str, Any] = {"skipped": [], "errors": []}
+    session.commit()
+    notes: dict[str, Any] = {"errors": []}
 
-    progress("Collecting news and events")
     tickers = list(dict.fromkeys(universe_tickers(mode) + watchlist_tickers(session, mode)))
     companies = ensure_universe_companies(session, mode, tickers)
     run.universe_size = len(companies)
-    try:
-        notes["news"] = ingest_universe_news(session, mode, companies)
-    except ProviderError as exc:
-        notes["errors"].append(f"news ingestion: {exc.message}")
     session.commit()
 
-    # Candidates: companies tied to recent/upcoming events first, then watchlist, then the rest.
-    watch = set(watchlist_tickers(session, mode))
-    ranked: list[tuple[float, str]] = []
-    for t, c in companies.items():
-        cat, _ = catalyst_score(company_events(session, c.id))
-        ranked.append((cat + (0.5 if t in watch else 0.0), t))
-    ranked.sort(reverse=True)
-    candidates = [t for _, t in ranked[: s.discovery_max_candidates]]
+    # 1–2. Baseline + coverage for the whole universe (independent of past analyses)
+    notes["baseline"] = refresh_baseline(session, mode, companies, progress)
+    try:
+        notes["news"] = ingest_universe_news(session, mode, companies, progress=progress)
+        notes["filings"] = ingest_universe_filings(session, mode, companies, progress=progress)
+    except ProviderError as exc:
+        notes["errors"].append(f"coverage: {exc.message}")
+    session.commit()
 
-    results: list[tuple[str, int]] = []
-    for n, t in enumerate(candidates, 1):
-        progress(f"Screening {t} ({n}/{len(candidates)})")
-        try:
-            out = analyze_ticker(session, t, mode, use_ai=False)
-            session.commit()
-            results.append((t, out.analysis_id))
-        except (AnalysisError, ProviderError) as exc:
-            session.rollback()
-            notes["skipped"].append({"ticker": t, "reason": str(exc)})
-        except Exception as exc:  # keep the run going; record the failure
-            session.rollback()
-            log.exception("discovery failed for %s", t)
-            notes["errors"].append({"ticker": t, "error": f"{type(exc).__name__}: {exc}"})
+    # 3. Selection
+    progress("Selecting candidates")
+    items = build_universe_items(session, mode, companies, datetime.now(UTC))
+    sel = select_candidates(items, seed, new_since, total=s.discovery_max_candidates, quotas=quotas)
+    order = {t: n for n, t in enumerate(sel.tickers, 1)}
+    rows: dict[str, DiscoveryCandidate] = {}
+    for it in items:
+        selected = it.ticker in order
+        rows[it.ticker] = DiscoveryCandidate(
+            run_id=run.id, company_id=it.company_id, ticker=it.ticker,
+            status="selected" if selected else ("ineligible" if not it.eligible else "not_selected"),
+            selected=selected, selection_order=order.get(it.ticker), pathway=sel.pathway_of(it.ticker),
+            qualifying_pathways=sel.qualifying.get(it.ticker, []), baseline_score=it.baseline_score,
+            catalyst_status=it.catalyst_status, catalyst_score=it.catalyst_score,
+            previously_analyzed=it.last_analyzed_at is not None, last_analyzed_at=it.last_analyzed_at,
+            tie_break_key=sel.tie_keys.get(it.ticker), data_timestamps=it.data_timestamps,
+            exclusion_reason=it.ineligible_reason,
+        )
+        session.add(rows[it.ticker])
+    session.commit()
+    by_ticker = {i.ticker: i for i in items}
 
-    def evaluate(t: str, aid: int) -> dict[str, Any] | None:
-        a = session.get(Analysis, aid)
-        c = companies[t]
+    # 4–5. Screening + scoring
+    evaluated: list[dict[str, Any]] = []
+
+    def evaluate(t: str, a: Analysis) -> dict[str, Any] | None:
+        row, item = rows[t], by_ticker[t]
         snap = a.snapshot or {}
+        row.analysis_id = a.id
         adv = (snap.get("price_stats") or {}).get("avg_dollar_volume_20d")
+        reason = None
         if adv is not None and adv < s.min_avg_dollar_volume:
-            notes["skipped"].append({"ticker": t, "reason": f"illiquid (20d avg dollar volume {adv:,.0f})"})
+            reason = f"illiquid (20d avg dollar volume {adv:,.0f})"
+        elif snap.get("base_target_12m") is None:
+            reason = "no valid valuation (missing/implausible data or no applicable method)"
+        if reason:
+            row.status, row.exclusion_reason = "excluded", reason
             return None
-        if snap.get("base_target_12m") is None:
-            notes["skipped"].append({"ticker": t, "reason": "no valuation method applicable"})
-            return None
-        evs = company_events(session, c.id)
+        evs = company_events(session, a.company_id)
         cat, cat_ev = catalyst_score(evs)
         lf = snap.get("latest_filing_date")
         age = (date.today() - date.fromisoformat(lf)).days if lf else None
-        sc = score_candidate(snap, cat, age)
-        upcoming = [e for e, _ in evs if e.event_date]
-        soon = any(e.event_date <= date.today() + timedelta(days=60) and (e.materiality or 0) >= 0.5 for e in upcoming)
+        result: ScoreResult = compute_score(factor_values(snap, item.catalyst_status, cat, age))
+        row.status, row.score, row.factors = "screened", result.score, result.to_dict()
+        soon = any(e.event_date and e.event_date <= date.today() + timedelta(days=60) and (e.materiality or 0) >= 0.5
+                   for e, _ in evs)
         recent_material = cat_ev is not None and cat_ev.event_date is None and cat >= 0.5
-        return {"ticker": t, "analysis": a, "score": sc, "catalyst": cat_ev,
+        return {"ticker": t, "analysis": a, "score": result, "catalyst": cat_ev, "age": age, "cat": cat,
                 "horizon": "short_term" if (soon or recent_material) else "long_term"}
 
-    evaluated = [e for e in (evaluate(t, aid) for t, aid in results) if e]
-    evaluated.sort(key=lambda e: e["score"]["score"], reverse=True)
+    for n, t in enumerate(sel.tickers, 1):
+        progress(f"Screening {t} ({n}/{len(sel.tickers)})")
+        try:
+            out = analyze_ticker(session, t, mode, use_ai=False)
+            session.commit()
+            e = evaluate(t, session.get(Analysis, out.analysis_id))
+            if e:
+                evaluated.append(e)
+        except (AnalysisError, ProviderError) as exc:
+            session.rollback()
+            rows[t].status, rows[t].exclusion_reason = "excluded", str(exc)
+        except Exception as exc:  # keep the run going; record the failure
+            session.rollback()
+            log.exception("discovery failed for %s", t)
+            rows[t].status, rows[t].exclusion_reason = "excluded", f"error: {type(exc).__name__}: {exc}"
+            notes["errors"].append({"ticker": t, "error": f"{type(exc).__name__}: {exc}"})
+        session.commit()
 
-    # Second pass: AI-assisted analysis only for the top few (budget control).
+    def sort_key(e: dict[str, Any]) -> tuple:
+        # exact score, then financial strength, then the seeded rotation key (never the ticker name)
+        sc = e["score"]
+        return (-(sc.exact if sc.exact is not None else -1), -(sc.factors.get("financial_strength") or 0),
+                rows[e["ticker"]].tie_break_key or "")
+
+    evaluated.sort(key=sort_key)
+
+    # 6. AI only for the top N, then re-score with the AI-adjusted forecast
     if mode == "live" and s.openai_configured:
         for e in evaluated[: s.discovery_ai_top_n]:
             progress(f"AI analysis {e['ticker']}")
             try:
                 out = analyze_ticker(session, e["ticker"], mode, use_ai=True)
                 session.commit()
-                e["analysis"] = session.get(Analysis, out.analysis_id)
+                a = session.get(Analysis, out.analysis_id)
+                e2 = evaluate(e["ticker"], a)
+                if e2:
+                    e.update(e2)
+                session.commit()
             except Exception as exc:
                 session.rollback()
                 notes["errors"].append({"ticker": e["ticker"], "error": f"AI pass: {exc}"})
+        evaluated.sort(key=sort_key)
 
+    # 7. Persist ranking + audit
+    for rank, e in enumerate(evaluated, 1):
+        rows[e["ticker"]].final_rank = rank
+        if rank <= s.discovery_top_n:
+            rows[e["ticker"]].status = "ranked"
     for rank, e in enumerate(evaluated[: s.discovery_top_n], 1):
         a: Analysis = e["analysis"]
         f12 = session.scalar(select(Forecast).where(Forecast.analysis_id == a.id, Forecast.horizon_months == 12))
         ev = e["catalyst"]
+        sc: ScoreResult = e["score"]
         session.add(Recommendation(
             run_id=run.id, company_id=a.company_id, analysis_id=a.id, forecast_id=f12.id if f12 else None, rank=rank,
-            score=e["score"]["score"], score_band=e["score"]["band"], factors=e["score"],
+            score=sc.score, score_band=sc.band, factors=sc.to_dict(),
             outlook=(a.snapshot or {}).get("outlook", "neutral"), risk_rating=(a.snapshot or {}).get("risk_rating", "Medium"),
             horizon_class=e["horizon"], catalyst_event_id=ev.id if ev else None,
             catalyst_title=ev.title if ev else None, catalyst_date=ev.event_date if ev else None,
+            selection_pathway=rows[e["ticker"]].pathway,
         ))
-    run.candidates_evaluated = len(results)
+
+    run.stats = run_stats(list(rows.values()), sel, companies)
+    run.candidates_evaluated = len(sel.tickers)
     run.status = "succeeded"
     run.finished_at = datetime.now(UTC)
     run.notes = notes
     session.flush()
     return run
+
+
+def run_stats(rows: list[DiscoveryCandidate], sel, companies: dict[str, Company]) -> dict[str, Any]:
+    sel_rows = [r for r in rows if r.selected]
+    ranked = sorted([r for r in rows if r.final_rank and r.status == "ranked"], key=lambda r: r.final_rank)
+    sector = {t: (c.sector or "Unknown") for t, c in companies.items()}
+    letters = Counter(r.ticker[0] for r in sel_rows)
+    return {
+        "universe": len(rows),
+        "eligible": sum(1 for r in rows if r.status != "ineligible"),
+        "selected": len(sel_rows),
+        "pathway_slots": dict(sel.filled),
+        "coverage": dict(Counter(r.catalyst_status for r in rows)),
+        "selected_coverage": dict(Counter(r.catalyst_status for r in sel_rows)),
+        "previously_unanalyzed_selected": sum(1 for r in sel_rows if not r.previously_analyzed),
+        "previously_unanalyzed_ranked": sum(1 for r in ranked if not r.previously_analyzed),
+        "selected_sectors": dict(Counter(sector[r.ticker] for r in sel_rows)),
+        "ranked_sectors": dict(Counter(sector[r.ticker] for r in ranked)),
+        "selected_first_letter_span": f"{min(letters)}–{max(letters)}" if letters else None,
+        "excluded": sum(1 for r in rows if r.status == "excluded"),
+        "ranked": len(ranked),
+    }

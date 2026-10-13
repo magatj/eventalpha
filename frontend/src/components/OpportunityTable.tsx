@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 
 import { OutlookBadge, PriceTag, ProvenanceBadge, ReturnText, RiskBadge } from "@/components/common";
+import { PathwayBadge } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/table";
 import type { DiscoveryItem } from "@/lib/api";
@@ -38,6 +39,7 @@ export function OpportunityTable({ items, compact = false }: { items: DiscoveryI
           <TH>Risk</TH>
           <TH>Horizon</TH>
           {!compact && <TH>Score</TH>}
+          {!compact && <TH title="How this stock qualified for the candidate list">Pathway</TH>}
           <TH>Catalyst</TH>
           {!compact && <TH>Analyzed</TH>}
         </TR>
@@ -80,6 +82,11 @@ export function OpportunityTable({ items, compact = false }: { items: DiscoveryI
               <TD title={scoreTooltip(i)}>
                 <span className="num font-medium">{i.score}</span>
                 <span className="ml-1 text-[11px] text-subtle">{i.score_band}</span>
+              </TD>
+            )}
+            {!compact && (
+              <TD>
+                <PathwayBadge pathway={i.selection_pathway} />
               </TD>
             )}
             <TD className="max-w-64 whitespace-normal">

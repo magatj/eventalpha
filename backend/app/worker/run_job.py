@@ -18,7 +18,7 @@ from app.services.providers import get_data_mode
 from app.worker.handlers import HANDLERS
 from app.worker.main import run_one
 
-TRADING_DAY_JOBS = {"refresh_prices", "catalyst_analysis", "discovery"}
+TRADING_DAY_JOBS = {"refresh_prices", "refresh_baseline", "catalyst_analysis", "discovery"}
 
 
 def main(argv: list[str]) -> int:

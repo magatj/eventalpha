@@ -229,11 +229,15 @@ class MassiveProvider(MarketDataProvider):
         return quotes
 
     def get_company_news(self, ticker: str, limit: int = 20) -> list[ProviderArticle]:
-        data = self.client.get_json(
-            "/v2/reference/news",
-            {"ticker": ticker.upper(), "limit": limit, "order": "desc", "sort": "published_utc"},
-            cache_ttl=timedelta(minutes=60),
-        )
+        return self._news({"ticker": ticker.upper(), "limit": limit, "order": "desc", "sort": "published_utc"})
+
+    def get_market_news(self, limit: int = 1000) -> list[ProviderArticle]:
+        # One request returns ~1000 articles tagged with tickers across the whole market.
+        return self._news({"limit": min(limit, 1000), "order": "desc", "sort": "published_utc"},
+                          ttl=timedelta(minutes=50))
+
+    def _news(self, params: dict, ttl: timedelta = timedelta(minutes=60)) -> list[ProviderArticle]:
+        data = self.client.get_json("/v2/reference/news", params, cache_ttl=ttl)
         out: list[ProviderArticle] = []
         for raw in (data or {}).get("results") or []:
             try:

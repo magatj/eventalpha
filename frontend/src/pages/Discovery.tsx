@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import { DemoBadge, EmptyState, ErrorState, LoadingRows, PageHeader } from "@/components/common";
 import { OpportunityTable } from "@/components/OpportunityTable";
+import { SelectionAudit, SelectionSummary } from "@/components/SelectionAudit";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select } from "@/components/ui/input";
@@ -84,6 +85,11 @@ export default function DiscoveryPage() {
           </span>
         )}
       </div>
+      {data?.run?.stats && (
+        <div className="mb-4">
+          <SelectionSummary stats={data.run.stats} />
+        </div>
+      )}
       <Card>
         <CardContent className="pt-4">
           {isLoading ? (
@@ -104,6 +110,7 @@ export default function DiscoveryPage() {
           <Info className="mt-0.5 size-3.5 shrink-0" /> {data.ranking_explanation}
         </p>
       )}
+      <SelectionAudit />
       {notes?.skipped && notes.skipped.length > 0 && (
         <details className="mt-3 text-xs text-muted">
           <summary className="cursor-pointer">{notes.skipped.length} candidate(s) skipped</summary>
