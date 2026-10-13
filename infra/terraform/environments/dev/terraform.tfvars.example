@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (git-ignored). Lowest-cost dev defaults are already set.
+region         = "us-east-1"
+sec_user_agent = "EventAlpha your-email@example.com"
+image_tag      = "REPLACE_WITH_COMMIT_SHA"
+alarm_email    = "you@example.com"
+# enable_nat_gateway = true   # private tasks behind NAT (+~$32/month)

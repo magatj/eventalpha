@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+/* EventAlpha dark navy theme. Chart series colors were validated for CVD separation on the
+   card surface (dataviz validator): series-1/2/3. Up/down green/red do NOT separate for
+   deuteranopia, so every gain/loss also carries a sign, arrow icon and text label. */
+@theme {
+  --color-background: #0b1220;
+  --color-surface: #111a2e;
+  --color-surface-2: #16213a;
+  --color-surface-3: #1c2a48;
+  --color-border: #22304d;
+  --color-foreground: #e6edf7;
+  --color-muted: #8a9bb8;
+  --color-subtle: #5d6f8f;
+  --color-accent: #3b82f6;
+  --color-accent-foreground: #ffffff;
+  --color-up: #22c55e;
+  --color-down: #ef4444;
+  --color-warn: #f59e0b;
+  --color-demo: #a855f7;
+  --color-series-1: #3b8fe8;
+  --color-series-2: #c27c0e;
+  --color-series-3: #9277e6;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-feature-settings: "tnum" 1;
+    -webkit-font-smoothing: antialiased;
+  }
+  * {
+    border-color: var(--color-border);
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 40%, transparent);
+  }
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Recharts tooltip/axis polish */
+.recharts-cartesian-grid line {
+  stroke: var(--color-border);
+  stroke-opacity: 0.6;
+}
+.recharts-text {
+  fill: var(--color-muted);
+  font-size: 11px;
+}

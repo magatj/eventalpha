@@ -1,0 +1,4 @@
+{"request_id":"ghi","status":"OK","results":{"ticker":"NKE","name":"Nike Inc.","market":"stocks","locale":"us",
+ "primary_exchange":"XNYS","type":"CS","active":true,"currency_name":"usd","cik":"0000320187",
+ "market_cap":105000000000.0,"sic_code":"3021","sic_description":"RUBBER & PLASTICS FOOTWEAR",
+ "share_class_shares_outstanding":1180000000,"weighted_shares_outstanding":1477000000,"list_date":"1980-12-02"}}

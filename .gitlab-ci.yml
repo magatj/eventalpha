@@ -1,0 +1,197 @@
+# EventAlpha GitLab CI/CD
+#
+# Stages run lint → tests → builds → Terraform checks on every pipeline.
+# AWS stages (plan, deploy) are DISABLED by default. Enable them by setting the CI/CD
+# variable ENABLE_AWS=true and AWS_ROLE_ARN (an IAM role trusting GitLab's OIDC provider).
+# Credentials are short-lived (OIDC web identity) — no long-lived AWS keys are stored.
+# Deployment additionally requires a manual click (`when: manual`) on the default branch.
+
+stages:
+  - lint
+  - unit-test
+  - integration-test
+  - frontend-build
+  - docker-build
+  - terraform-validate
+  - terraform-plan
+  - deploy
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  npm_config_cache: "$CI_PROJECT_DIR/.cache/npm"
+  TF_VERSION: "1.10.5"
+  TF_ENV: "dev"
+  PYTHON_IMAGE: "python:3.12-slim"
+  NODE_IMAGE: "node:22-alpine"
+  AWS_REGION: "us-east-1"
+
+default:
+  interruptible: true
+
+.python:
+  image: $PYTHON_IMAGE
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.cache/pip]
+  before_script:
+    - cd backend
+    - pip install -q -r requirements-dev.txt
+
+.node:
+  image: $NODE_IMAGE
+  cache:
+    key:
+      files: [frontend/package-lock.json]
+    paths: [.cache/npm]
+  before_script:
+    - cd frontend
+    - npm ci --no-audit --no-fund
+
+.aws_oidc:
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - |
+      # Exchange the GitLab OIDC token for temporary AWS credentials (never echoed).
+      set +x
+      CREDS=$(aws sts assume-role-with-web-identity --role-arn "$AWS_ROLE_ARN" \
+        --role-session-name "gitlab-$CI_PIPELINE_ID" --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+      export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | cut -f1)
+      export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | cut -f2)
+      export AWS_SESSION_TOKEN=$(echo "$CREDS" | cut -f3)
+
+# ------------------------------------------------------------------------- lint
+backend-lint:
+  stage: lint
+  extends: .python
+  script:
+    - ruff check app tests
+    - ruff format --check app tests || echo "formatting differences (non-blocking)"
+
+frontend-lint:
+  stage: lint
+  extends: .node
+  script:
+    - npm run lint
+    - npm run typecheck
+
+# ------------------------------------------------------------------------- tests
+backend-unit:
+  stage: unit-test
+  extends: .python
+  script:
+    - pytest -q --ignore=tests/integration --junitxml=report.xml --cov=app --cov-report=term
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report.xml
+
+frontend-unit:
+  stage: unit-test
+  extends: .node
+  script:
+    - npm test
+
+backend-integration:
+  stage: integration-test
+  extends: .python
+  services:
+    - name: postgres:17-alpine
+      alias: db
+  variables:
+    POSTGRES_DB: eventalpha_test
+    POSTGRES_USER: eventalpha
+    POSTGRES_PASSWORD: ci_only_password
+    TEST_DATABASE_URL: postgresql+psycopg://eventalpha:ci_only_password@db:5432/eventalpha_test
+    DATA_MODE: demo
+  script:
+    - pytest -q tests/integration --junitxml=report-int.xml
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report-int.xml
+
+# ------------------------------------------------------------------------- builds
+frontend-build:
+  stage: frontend-build
+  extends: .node
+  script:
+    - npm run build
+  artifacts:
+    paths: [frontend/dist]
+    expire_in: 1 week
+
+docker-build:
+  stage: docker-build
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build --target prod -t eventalpha-backend:$CI_COMMIT_SHORT_SHA backend
+    - docker build --target build -t eventalpha-frontend-build:$CI_COMMIT_SHORT_SHA frontend
+    - docker save eventalpha-backend:$CI_COMMIT_SHORT_SHA | gzip > backend-image.tar.gz
+  artifacts:
+    paths: [backend-image.tar.gz]
+    expire_in: 2 days
+
+# ------------------------------------------------------------------------- terraform
+terraform-validate:
+  stage: terraform-validate
+  image:
+    name: hashicorp/terraform:$TF_VERSION
+    entrypoint: [""]
+  script:
+    - terraform -chdir=infra/terraform fmt -recursive -check
+    - for env in dev prod; do terraform -chdir=infra/terraform/environments/$env init -backend=false -input=false && terraform -chdir=infra/terraform/environments/$env validate; done
+
+terraform-plan:
+  stage: terraform-plan
+  extends: .aws_oidc
+  image:
+    name: hashicorp/terraform:$TF_VERSION
+    entrypoint: [""]
+  rules:
+    - if: '$ENABLE_AWS == "true" && $AWS_ROLE_ARN'
+  before_script:
+    - apk add --no-cache aws-cli >/dev/null
+    - !reference [.aws_oidc, before_script]
+  script:
+    - cd infra/terraform/environments/$TF_ENV
+    - echo "$TF_BACKEND_HCL" > backend.hcl
+    - terraform init -input=false -backend-config=backend.hcl
+    - terraform plan -input=false -var "image_tag=$CI_COMMIT_SHORT_SHA" -var "sec_user_agent=$SEC_USER_AGENT" -out=tfplan
+  artifacts:
+    paths: [infra/terraform/environments/$TF_ENV/tfplan]
+    expire_in: 1 day
+
+# ------------------------------------------------------------------------- deploy (manual, opt-in)
+deploy-aws:
+  stage: deploy
+  extends: .aws_oidc
+  image: docker:27
+  services: [docker:27-dind]
+  interruptible: false
+  rules:
+    - if: '$ENABLE_AWS == "true" && $AWS_ROLE_ARN && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  environment:
+    name: $TF_ENV
+  needs: [terraform-plan, docker-build, frontend-build]
+  before_script:
+    - apk add --no-cache aws-cli terraform >/dev/null
+    - !reference [.aws_oidc, before_script]
+  script:
+    - set +x
+    # 1. push the backend image (tag = commit SHA; ECR tags are immutable)
+    - gunzip -c backend-image.tar.gz | docker load
+    - REPO=$(aws ecr describe-repositories --repository-names "eventalpha-$TF_ENV/backend" --query 'repositories[0].repositoryUri' --output text)
+    - aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
+    - docker tag eventalpha-backend:$CI_COMMIT_SHORT_SHA $REPO:$CI_COMMIT_SHORT_SHA && docker push $REPO:$CI_COMMIT_SHORT_SHA
+    # 2. apply the reviewed plan
+    - cd infra/terraform/environments/$TF_ENV && echo "$TF_BACKEND_HCL" > backend.hcl
+    - terraform init -input=false -backend-config=backend.hcl && terraform apply -input=false tfplan
+    # 3. run migrations as a one-off task, 4. publish the frontend
+    - ../../../../scripts/aws-post-deploy.sh "$TF_ENV"

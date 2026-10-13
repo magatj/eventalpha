@@ -1,0 +1,129 @@
+# EventAlpha monitored universe — one US-listed ticker per line ('#' starts a comment).
+# Large/mid-cap names chosen for liquidity. Edit freely (100–500 recommended).
+# Tickers that SEC/Massive can't resolve are skipped and reported, not guessed.
+# Technology
+AAPL
+MSFT
+NVDA
+AVGO
+TSM
+AMD
+INTC
+QCOM
+TXN
+MU
+AMAT
+LRCX
+KLAC
+ADI
+MRVL
+ARM
+ORCL
+CRM
+ADBE
+NOW
+INTU
+PLTR
+SNOW
+PANW
+CRWD
+FTNT
+CSCO
+IBM
+ANET
+DELL
+HPE
+SMCI
+VRT
+# Communication services
+GOOGL
+META
+NFLX
+DIS
+CMCSA
+T
+VZ
+TMUS
+# Consumer discretionary
+AMZN
+TSLA
+HD
+LOW
+NKE
+SBUX
+MCD
+BKNG
+TJX
+LULU
+CMG
+GM
+F
+ABNB
+# Consumer staples
+WMT
+COST
+PG
+KO
+PEP
+PM
+MDLZ
+CL
+# Health care
+LLY
+UNH
+JNJ
+MRK
+ABBV
+PFE
+TMO
+ABT
+ISRG
+AMGN
+GILD
+VRTX
+REGN
+MRNA
+# Financials
+JPM
+BAC
+WFC
+GS
+MS
+C
+SCHW
+BLK
+AXP
+V
+MA
+PYPL
+# Industrials
+CAT
+DE
+GE
+HON
+BA
+LMT
+RTX
+UPS
+UNP
+ETN
+PH
+# Energy
+XOM
+CVX
+COP
+SLB
+OXY
+# Utilities
+NEE
+DUK
+SO
+CEG
+VST
+# Materials / real estate
+LIN
+FCX
+NEM
+PLD
+AMT
+EQIX

@@ -1,0 +1,69 @@
+# Manual, opt-in AWS deployment. Never runs on push.
+# Requirements (repository settings):
+#   * Variable  ENABLE_AWS = true            (otherwise every job is skipped)
+#   * Variable  AWS_ROLE_ARN                  IAM role trusting GitHub's OIDC provider (no long-lived keys)
+#   * Variable  SEC_USER_AGENT                "EventAlpha you@example.com"
+#   * Secret    TF_BACKEND_HCL                contents of backend.hcl
+#   * Environment protection rules on "dev"/"prod" for an extra approval step
+name: Deploy to AWS (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+      apply:
+        description: Apply the plan (false = plan only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC → short-lived AWS credentials
+
+jobs:
+  deploy:
+    if: vars.ENABLE_AWS == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_REGION: us-east-1
+      TF_DIR: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - name: Terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_BACKEND_HCL: ${{ secrets.TF_BACKEND_HCL }}
+        run: |
+          printf '%s' "$TF_BACKEND_HCL" > backend.hcl
+          terraform init -input=false -backend-config=backend.hcl
+          terraform plan -input=false -out=tfplan \
+            -var "image_tag=${GITHUB_SHA::12}" -var "sec_user_agent=${{ vars.SEC_USER_AGENT }}"
+      - name: Build and push backend image
+        if: inputs.apply
+        run: |
+          REPO=$(aws ecr describe-repositories --repository-names "eventalpha-${{ inputs.environment }}/backend" \
+            --query 'repositories[0].repositoryUri' --output text)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
+          docker build --target prod -t "$REPO:${GITHUB_SHA::12}" backend
+          docker push "$REPO:${GITHUB_SHA::12}"
+      - name: Terraform apply (reviewed plan)
+        if: inputs.apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false tfplan
+      - name: Migrations + frontend publish
+        if: inputs.apply
+        run: |
+          (cd frontend && npm ci --no-audit --no-fund && npm run build)
+          cd "$TF_DIR" && sh ../../../../scripts/aws-post-deploy.sh "${{ inputs.environment }}"

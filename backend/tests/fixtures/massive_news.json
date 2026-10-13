@@ -1,0 +1,6 @@
+{"status":"OK","count":2,"results":[
+ {"id":"n1","publisher":{"name":"Example Wire"},"title":"Nike (NYSE: NKE) raises full-year guidance","author":"x",
+  "published_utc":"2026-10-01T20:15:00Z","article_url":"https://example.com/nke-guidance?utm_source=feed",
+  "tickers":["NKE"],"description":"Nike raised its outlook.","insights":[{"ticker":"NKE","sentiment":"positive","sentiment_reasoning":"r"}]},
+ {"id":"n2","title":"Missing url is skipped","published_utc":"2026-10-01T20:15:00Z","tickers":["NKE"]}
+]}

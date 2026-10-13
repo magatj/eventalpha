@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Sample Press Releases</title>
+<item><title>Acme Corp (NASDAQ: ACME) announces record quarterly results</title><link>https://example.com/pr/1</link>
+<pubDate>Mon, 12 Oct 2026 13:00:00 GMT</pubDate><description><![CDATA[<p>Revenue rose 20%.</p>]]></description></item>
+<item><title>Federal Reserve issues FOMC statement</title><link>https://example.com/pr/2</link>
+<pubDate>Wed, 30 Sep 2026 18:00:00 GMT</pubDate></item>
+<item><title></title><link>https://example.com/pr/empty</link></item>
+</channel></rss>

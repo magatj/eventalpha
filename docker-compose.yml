@@ -1,0 +1,91 @@
+# EventAlpha local stack. Start: scripts\start.ps1  (or: docker compose up -d --build)
+# Frontend runs with Vite on the host by default (faster); add `--profile frontend` to containerize it.
+name: eventalpha
+
+x-backend: &backend
+  build:
+    context: ./backend
+    target: dev
+  image: eventalpha-backend:dev
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-eventalpha}:${POSTGRES_PASSWORD:-eventalpha_local_dev}@db:5432/${POSTGRES_DB:-eventalpha}
+  volumes:
+    - ./backend:/app
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-eventalpha}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eventalpha_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-eventalpha}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "app"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-eventalpha}:${POSTGRES_PASSWORD:-eventalpha_local_dev}@db:5432/${POSTGRES_DB:-eventalpha}
+      EMBEDDED_WORKER: "false"  # the dedicated worker service runs jobs
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "app.worker.main"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *backend
+    command: ["python", "-m", "app.scheduler.main"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    profiles: ["frontend"]
+    build:
+      context: ./frontend
+      target: dev
+    environment:
+      VITE_API_PROXY_TARGET: http://api:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

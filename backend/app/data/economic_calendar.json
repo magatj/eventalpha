@@ -1,0 +1,23 @@
+{
+  "_source": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+  "_retrieved": "2026-10-12",
+  "_note": "Second day of each two-day FOMC meeting (statement day). 2027 dates are tentative per the Federal Reserve until confirmed at the preceding meeting. Update this file when the Fed publishes changes.",
+  "events": [
+    {"date": "2026-01-28", "title": "FOMC rate decision", "status": "scheduled"},
+    {"date": "2026-03-18", "title": "FOMC rate decision + Summary of Economic Projections", "status": "scheduled"},
+    {"date": "2026-04-29", "title": "FOMC rate decision", "status": "scheduled"},
+    {"date": "2026-06-17", "title": "FOMC rate decision + Summary of Economic Projections", "status": "scheduled"},
+    {"date": "2026-07-29", "title": "FOMC rate decision", "status": "scheduled"},
+    {"date": "2026-09-16", "title": "FOMC rate decision + Summary of Economic Projections", "status": "scheduled"},
+    {"date": "2026-10-28", "title": "FOMC rate decision", "status": "scheduled"},
+    {"date": "2026-12-09", "title": "FOMC rate decision + Summary of Economic Projections", "status": "scheduled"},
+    {"date": "2027-01-27", "title": "FOMC rate decision (tentative)", "status": "scheduled"},
+    {"date": "2027-03-17", "title": "FOMC rate decision + SEP (tentative)", "status": "scheduled"},
+    {"date": "2027-04-28", "title": "FOMC rate decision (tentative)", "status": "scheduled"},
+    {"date": "2027-06-09", "title": "FOMC rate decision + SEP (tentative)", "status": "scheduled"},
+    {"date": "2027-07-28", "title": "FOMC rate decision (tentative)", "status": "scheduled"},
+    {"date": "2027-09-15", "title": "FOMC rate decision + SEP (tentative)", "status": "scheduled"},
+    {"date": "2027-10-27", "title": "FOMC rate decision (tentative)", "status": "scheduled"},
+    {"date": "2027-12-08", "title": "FOMC rate decision + SEP (tentative)", "status": "scheduled"}
+  ]
+}
