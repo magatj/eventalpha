@@ -20,6 +20,7 @@ from app.providers.market.base import (
     CorporateActionData,
     IndexQuote,
     LatestPrice,
+    ListedSecurity,
     MarketDataProvider,
     PriceBar,
     ProviderArticle,
@@ -39,10 +40,11 @@ log = logging.getLogger(__name__)
 
 PROVIDER = "massive"
 
-INDEX_PROXIES = [
-    ("SPY", "S&P 500", "SPDR S&P 500 ETF (proxy)"),
-    ("QQQ", "Nasdaq-100", "Invesco QQQ ETF (proxy)"),
-    ("DIA", "Dow Jones Industrial Average", "SPDR Dow Jones ETF (proxy)"),
+# (display symbol, index name, Massive index ticker if the plan is entitled, FRED series, fallback ETF)
+INDEXES = [
+    ("SPX", "S&P 500", None, "SP500", "SPY"),  # I:SPX / I:DJI need a paid Massive Indices plan (HTTP 403)
+    ("NDX", "Nasdaq-100", "I:NDX", "NASDAQ100", "QQQ"),
+    ("DJI", "Dow Jones Industrial Average", None, "DJIA", "DIA"),
 ]
 
 
@@ -122,7 +124,8 @@ class MassiveProvider(MarketDataProvider):
         "Free plan: end-of-day prices (previous close), not real-time quotes.",
         "Free plan: about 2 years of daily history.",
         "Free plan: 5 requests/minute; requests are queued client-side.",
-        "Index levels require a paid Indices plan; SPY/QQQ/DIA ETFs are shown as proxies.",
+        "Index levels are the official closes: S&P 500 and Dow Jones from FRED (St. Louis Fed), Nasdaq-100 from "
+        "Massive. FRED publishes a session's close in the evening or the next morning; each tile shows its date.",
     ]
 
     def __init__(self, settings: Settings, cache: ResponseCache | None = None, client: HttpClient | None = None):
@@ -207,26 +210,52 @@ class MassiveProvider(MarketDataProvider):
         return sorted(out, key=lambda c: c.ex_date)
 
     def get_market_indices(self) -> list[IndexQuote]:
+        """Actual index levels, not ETF prices. Preference per index: Massive index aggregates where the plan
+        is entitled (the free plan includes the Nasdaq-100 but not the S&P 500 or Dow), then the official
+        close published by FRED, and only if both fail the ETF price, labeled as a proxy."""
+        from app.providers.market.fred import FredIndexSource
+
+        fred: dict = {}
+        fred_error = None
+        try:
+            fred = FredIndexSource(cache=self.client.cache).latest([x[3] for x in INDEXES])
+        except ProviderError as exc:
+            fred_error = exc.message
         quotes: list[IndexQuote] = []
         end = date.today()
-        for sym, index_name, label in INDEX_PROXIES:
-            try:
-                data = self.client.get_json(
-                    f"/v2/aggs/ticker/{sym}/range/1/day/{end - timedelta(days=10)}/{end}",
-                    {"adjusted": "true", "sort": "asc"}, cache_ttl=timedelta(hours=3),
-                )
-                bars = [_bar(a) for a in (self._validate(_AggsResponse, data, "aggregates").results or [])]
-                if not bars:
-                    raise DataUnavailable(PROVIDER, f"no bars for {sym}")
-                last = bars[-1]
-                chg = (last.close / bars[-2].close - 1) if len(bars) > 1 else None
-                quotes.append(IndexQuote(symbol=sym, name=label, value=last.close, change_pct=chg,
-                                         as_of_date=last.date, kind="etf_proxy", proxy_for=index_name,
-                                         source=PROVIDER))
-            except ProviderError as exc:
-                quotes.append(IndexQuote(symbol=sym, name=label, value=None, kind="etf_proxy",
-                                         proxy_for=index_name, source=PROVIDER, unavailable_reason=exc.message))
+        for sym, name, massive_ticker, fred_id, etf in INDEXES:
+            q = None
+            if massive_ticker:
+                try:
+                    q = self._index_from_aggs(massive_ticker, name, end, kind="index")
+                    q.symbol = sym
+                except ProviderError:
+                    q = None
+            if q is None and fred_id in fred:
+                d, v, prev = fred[fred_id]
+                q = IndexQuote(symbol=sym, name=name, value=v, change_pct=(v / prev - 1) if prev else None,
+                               as_of_date=d, kind="index", source="fred")
+            if q is None:  # last resort: the ETF, clearly labeled as a proxy
+                try:
+                    q = self._index_from_aggs(etf, name, end, kind="etf_proxy")
+                    q.unavailable_reason = f"index level unavailable ({fred_error or 'no published close'}); ETF shown"
+                except ProviderError as exc:
+                    q = IndexQuote(symbol=sym, name=name, value=None, kind="index", source="fred",
+                                   unavailable_reason=fred_error or exc.message)
+            quotes.append(q)
         return quotes
+
+    def _index_from_aggs(self, ticker: str, name: str, end: date, kind: str) -> IndexQuote:
+        data = self.client.get_json(f"/v2/aggs/ticker/{ticker}/range/1/day/{end - timedelta(days=10)}/{end}",
+                                    {"adjusted": "true", "sort": "asc"}, cache_ttl=timedelta(hours=3))
+        bars = [_bar(a) for a in (self._validate(_AggsResponse, data, "aggregates").results or [])]
+        if not bars:
+            raise DataUnavailable(PROVIDER, f"no bars for {ticker}")
+        last = bars[-1]
+        chg = (last.close / bars[-2].close - 1) if len(bars) > 1 else None
+        return IndexQuote(symbol=ticker, name=name if kind == "index" else f"{ticker} ETF (proxy)", value=last.close,
+                          change_pct=chg, as_of_date=last.date, kind=kind,  # type: ignore[arg-type]
+                          proxy_for=name if kind == "etf_proxy" else None, source=PROVIDER)
 
     def get_company_news(self, ticker: str, limit: int = 20) -> list[ProviderArticle]:
         return self._news({"ticker": ticker.upper(), "limit": limit, "order": "desc", "sort": "published_utc"})
@@ -255,9 +284,63 @@ class MassiveProvider(MarketDataProvider):
             ))
         return out
 
-    def get_grouped_daily(self, day: date) -> dict[str, PriceBar]:
+    def list_securities(self, security_type: str, on_page=lambda n: None, max_pages: int = 50) -> list[ListedSecurity]:
+        """Paginated /v3/reference/tickers (1000 per page, follows next_url)."""
+        from dateutil import parser as dtparser
+
+        url: str | None = "/v3/reference/tickers"
+        params: dict | None = {"market": "stocks", "active": "true", "type": security_type, "limit": 1000,
+                               "order": "asc", "sort": "ticker"}
+        out: list[ListedSecurity] = []
+        pages = 0
+        while url and pages < max_pages:
+            data = self.client.get_json(url, params)
+            pages += 1
+            for r in (data or {}).get("results") or []:
+                if not r.get("ticker"):
+                    continue
+                lu = r.get("last_updated_utc")
+                out.append(ListedSecurity(
+                    ticker=r["ticker"], name=r.get("name"), exchange=r.get("primary_exchange"),
+                    security_type=r.get("type"), active=bool(r.get("active", True)),
+                    currency=(r.get("currency_name") or "").upper() or None, locale=r.get("locale"),
+                    cik=str(r["cik"]).zfill(10) if r.get("cik") else None,
+                    composite_figi=r.get("composite_figi"), share_class_figi=r.get("share_class_figi"),
+                    last_updated=dtparser.isoparse(lu) if lu else None,
+                ))
+            on_page(pages)
+            url, params = (data or {}).get("next_url"), None
+        if url:
+            raise ProviderError(PROVIDER, f"ticker list truncated after {max_pages} pages")
+        return out
+
+    def list_splits(self, since: date, max_pages: int = 10) -> list[tuple[str, CorporateActionData]]:
+        """Market-wide /v3/reference/splits since a date (1000 per page, follows next_url)."""
+        url: str | None = "/v3/reference/splits"
+        params: dict | None = {"execution_date.gte": since.isoformat(), "limit": 1000, "order": "asc",
+                               "sort": "execution_date"}
+        out: list[tuple[str, CorporateActionData]] = []
+        pages = 0
+        while url and pages < max_pages:
+            data = self.client.get_json(url, params, cache_ttl=timedelta(hours=12))
+            pages += 1
+            for raw in (data or {}).get("results") or []:
+                try:
+                    s = _Split.model_validate(raw)
+                except ValidationError:
+                    continue
+                if raw.get("ticker") and s.split_from > 0 and s.split_to > 0:
+                    out.append((raw["ticker"], CorporateActionData(action_type="split", ex_date=s.execution_date,
+                                                                   split_from=s.split_from, split_to=s.split_to)))
+            url, params = (data or {}).get("next_url"), None
+        if url:
+            raise ProviderError(PROVIDER, f"split list truncated after {max_pages} pages")
+        return out
+
+    def get_grouped_daily(self, day: date, adjusted: bool = False) -> dict[str, PriceBar]:
         data = self.client.get_json(
-            f"/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "false"}, cache_ttl=timedelta(hours=12)
+            f"/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true" if adjusted else "false"},
+            cache_ttl=timedelta(hours=12),
         )
         resp = self._validate(_AggsResponse, data, "grouped daily")
         return {a.T: _bar(a) for a in resp.results or [] if a.T}

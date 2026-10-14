@@ -11,6 +11,8 @@ locals {
     { name = "SEC_USER_AGENT", value = var.sec_user_agent },
     { name = "OPENAI_MODEL", value = var.openai_model },
     { name = "AI_MONTHLY_BUDGET_USD", value = tostring(var.ai_monthly_budget_usd) },
+    { name = "OPENAI_CHAT_MODEL", value = var.openai_chat_model },
+    { name = "CHAT_MONTHLY_BUDGET_USD", value = tostring(var.chat_monthly_budget_usd) },
     { name = "SCHEDULER_ENABLED", value = "false" }, # EventBridge Scheduler replaces APScheduler
     { name = "EMBEDDED_WORKER", value = "false" },
     { name = "CORS_ORIGINS", value = join(",", var.cors_origins) },

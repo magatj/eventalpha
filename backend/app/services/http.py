@@ -129,6 +129,21 @@ class DbCache:
 
 SENSITIVE_PARAMS = {"apikey", "api_key", "token", "key"}
 
+# Network requests actually sent per provider in this process (cache hits excluded); used to
+# report real API usage per discovery run.
+CALL_COUNTS: dict[str, int] = {}
+CACHE_HITS: dict[str, int] = {}
+
+
+def call_snapshot() -> dict[str, dict[str, int]]:
+    return {"requests": dict(CALL_COUNTS), "cache_hits": dict(CACHE_HITS)}
+
+
+def call_delta(before: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    now = call_snapshot()
+    return {kind: {p: now[kind].get(p, 0) - before[kind].get(p, 0) for p in now[kind]
+                   if now[kind].get(p, 0) - before[kind].get(p, 0)} for kind in now}
+
 
 def cache_key(provider: str, url: str, params: dict[str, Any] | None) -> str:
     clean = {k: v for k, v in sorted((params or {}).items()) if k.lower() not in SENSITIVE_PARAMS}
@@ -175,12 +190,14 @@ class HttpClient:
         if cache_ttl and self.cache:
             hit = self.cache.get(key)
             if hit is not None:
+                CACHE_HITS[self.provider] = CACHE_HITS.get(self.provider, 0) + 1
                 return hit if as_json else hit.get("text", "")
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             if self.rate_limiter:
                 self.rate_limiter.acquire()
+            CALL_COUNTS[self.provider] = CALL_COUNTS.get(self.provider, 0) + 1
             try:
                 resp = self._client.get(url, params=params)
             except (httpx.TimeoutException, httpx.TransportError) as exc:

@@ -35,7 +35,8 @@ def _raw(a) -> RawArticle:  # ProviderArticle -> RawArticle
 
 
 def ingest_universe_news(session: Session, mode: DataMode, companies: dict[str, Company],
-                         rotate_n: int | None = None, progress: Callable[[str], None] = lambda m: None) -> dict[str, Any]:
+                         rotate_n: int | None = None, progress: Callable[[str], None] = lambda m: None,
+                         resolver=None, known_tickers: set[str] | None = None) -> dict[str, Any]:
     s = get_settings()
     rotate_n = s.news_rotation_per_run if rotate_n is None else rotate_n
     stats: dict[str, Any] = {"errors": []}
@@ -50,7 +51,8 @@ def ingest_universe_news(session: Session, mode: DataMode, companies: dict[str, 
         progress("Market-wide news")
         try:
             arts = mp.get_market_news()
-            st = ingest_articles(session, mode, [_raw(a) for a in arts], companies)
+            # resolver/known_tickers let market-wide news introduce stocks outside the monitored set
+            st = ingest_articles(session, mode, [_raw(a) for a in arts], dict(companies), resolver, known_tickers)
             stats["market_wide"] = {"articles": len(arts), **st}
             dated = [a.published_at for a in arts if a.published_at]
             if dated:

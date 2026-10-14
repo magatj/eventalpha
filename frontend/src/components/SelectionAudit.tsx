@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
-import { EmptyState, Kpi, LoadingRows, PathwayBadge } from "@/components/common";
+import { EmptyState, Kpi, LoadingRows, PathwayBadge, ValuationStatusBadge } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -57,7 +57,17 @@ function row(c: CandidateRow) {
       <TD className="text-[11px] text-subtle">
         price {day(c.data_timestamps?.price_date)} · filing {day(c.data_timestamps?.financials_as_of)}
       </TD>
-      <TD className="max-w-72 whitespace-normal text-xs text-muted">{c.exclusion_reason ?? ""}</TD>
+      <TD className="max-w-72 whitespace-normal text-xs text-muted">
+        {c.exclusion_reason ?? ""}
+        {c.exclusion_codes && c.exclusion_codes.length > 1 && (
+          <div className="text-[11px] text-subtle">all checks failed: {c.exclusion_codes.map((x) => x.replace(/_/g, " ")).join(", ")}</div>
+        )}
+        {c.valuation_status && c.valuation_status !== "valid" && (
+          <div className="mt-0.5">
+            <ValuationStatusBadge status={c.valuation_status} />
+          </div>
+        )}
+      </TD>
     </TR>
   );
 }
@@ -65,8 +75,8 @@ function row(c: CandidateRow) {
 export function SelectionAudit() {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState<"selected" | "all">("selected");
-  const { data, isLoading, error } = useDiscoveryCandidates(open);
-  const rows = (data?.candidates ?? []).filter((c) => filter === "all" || c.selected);
+  const { data, isLoading, error } = useDiscoveryCandidates(open, filter);
+  const rows = data?.candidates ?? [];
   return (
     <Card className="mt-4">
       <CardHeader className="flex-row flex-wrap items-center justify-between gap-2">
@@ -98,7 +108,10 @@ export function SelectionAudit() {
             <EmptyState title="No audit available">Run discovery to produce one.</EmptyState>
           ) : (
             <div className="max-h-[520px] overflow-y-auto">
-              <p className="mb-2 text-[11px] text-subtle">Run #{data.run_id} · tie-break seed {data.seed}</p>
+              <p className="mb-2 text-[11px] text-subtle">
+                Run #{data.run_id} · tie-break seed {data.seed} · showing {rows.length} of {data.total_rows}
+                {rows.length < data.total_rows && " (download the CSV for every row)"}
+              </p>
               <Table>
                 <THead>
                   <TR>

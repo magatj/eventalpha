@@ -18,7 +18,10 @@ import {
   ProvenanceBadge,
   ReturnText,
   RiskBadge,
+  ValuationStatusBadge,
 } from "@/components/common";
+import { StockResearchChat } from "@/components/StockResearchChat";
+import { ValuationExplainer } from "@/components/ValuationExplainer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -105,6 +108,7 @@ export default function StockDetailPage() {
             {s.sector && <Badge>{s.sector}</Badge>}
             {s.industry && <Badge>{s.industry}</Badge>}
             {s.cik && <Badge>CIK {s.cik}</Badge>}
+            <ValuationStatusBadge status={s.latest_analysis?.valuation_status} />
           </div>
         </div>
         <div className="flex items-start gap-4">
@@ -128,7 +132,8 @@ export default function StockDetailPage() {
         </p>
       )}
 
-      <Tabs defaultValue="overview">
+      <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+      <Tabs defaultValue="overview" className="min-w-0">
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="financials">Financials</TabsTrigger>
@@ -152,6 +157,10 @@ export default function StockDetailPage() {
           <ForecastTab t={t} />
         </TabsContent>
       </Tabs>
+      <aside className="xl:sticky xl:top-4">
+        <StockResearchChat ticker={t} onRefreshData={refresh} />
+      </aside>
+      </div>
       <Disclaimer />
     </div>
   );
@@ -205,12 +214,18 @@ function Overview({ t }: { t: string }) {
       {a && (
         <Card>
           <CardHeader>
-            <CardTitle>Latest analysis snapshot</CardTitle>
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              Latest analysis snapshot <ValuationStatusBadge status={a.valuation_status} />
+              <span className="ml-auto">
+                <ProvenanceBadge kind="model_forecast" />
+              </span>
+            </CardTitle>
+            {a.valuation_method && <CardDescription>Valuation method: {a.valuation_method}</CardDescription>}
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-3 md:grid-cols-5">
             <Kpi label="Outlook (quant)" value={<OutlookBadge outlook={a.outlook} />} sub={a.ai_outlook ? `AI view: ${a.ai_outlook}` : undefined} />
             <Kpi label="Risk" value={<RiskBadge risk={a.risk_rating} />} />
-            <Kpi label="Bear 12m" value={money(a.bear_target_12m)} badge={<ProvenanceBadge kind="model_forecast" />} />
+            <Kpi label="Bear 12m" value={money(a.bear_target_12m)} />
             <Kpi label="Base 12m" value={money(a.base_target_12m)} sub={<ReturnText value={a.base_return_12m} />} />
             <Kpi label="Bull 12m" value={money(a.bull_target_12m)} />
           </CardContent>
@@ -578,6 +593,8 @@ export function DiffCard({ diff, prevAt }: { diff: import("@/lib/api").Diff; pre
 function ForecastTab({ t }: { t: string }) {
   const { data, isLoading, error, refetch } = useForecast(t);
   const hist = useForecastHistory(t, 12);
+  const analysis = useAnalysis(t);
+  const stock = useStock(t);
   const [h, setH] = useState(12);
   if (isLoading) return <LoadingRows rows={8} />;
   if (error) return <ErrorState error={error} onRetry={refetch} />;
@@ -600,6 +617,7 @@ function ForecastTab({ t }: { t: string }) {
         <ProvenanceBadge kind="model_forecast" /> {data!.interpretation}
       </Card>
       {f.assumptions?.warnings && f.assumptions.warnings.length > 0 && <Warnings items={f.assumptions.warnings} />}
+      {analysis.data?.valuation && analysis.data.id === f.analysis_id && <ValuationExplainer v={analysis.data.valuation} cik={stock.data?.cik} ticker={t} />}
       <div className="grid gap-4 lg:grid-cols-5">
         <Card className="lg:col-span-2">
           <CardHeader>

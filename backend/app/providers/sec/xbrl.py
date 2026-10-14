@@ -32,8 +32,16 @@ METRICS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
         ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
         ("us-gaap", "SalesRevenueGoodsNet"),
         ("us-gaap", "RevenuesNetOfInterestExpense"),
+        ("us-gaap", "RegulatedAndUnregulatedOperatingRevenue"),
+        ("us-gaap", "RealEstateRevenueNet"),
         ("ifrs-full", "Revenue"),
     ]),
+    # Industry revenue components. Only combined into revenue when no total-revenue concept is
+    # reported for the period (banks: NII + noninterest income; insurers: premiums + investment income).
+    "net_interest_income": (FLOW, "currency", [("us-gaap", "InterestIncomeExpenseNet")]),
+    "noninterest_income": (FLOW, "currency", [("us-gaap", "NoninterestIncome")]),
+    "premiums_earned": (FLOW, "currency", [("us-gaap", "PremiumsEarnedNet")]),
+    "net_investment_income": (FLOW, "currency", [("us-gaap", "NetInvestmentIncome")]),
     "gross_profit": (FLOW, "currency", [("us-gaap", "GrossProfit"), ("ifrs-full", "GrossProfit")]),
     "operating_income": (FLOW, "currency", [
         ("us-gaap", "OperatingIncomeLoss"), ("ifrs-full", "ProfitLossFromOperatingActivities"),
@@ -41,10 +49,15 @@ METRICS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
     "net_income": (FLOW, "currency", [
         ("us-gaap", "NetIncomeLoss"),
         ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic"),
-        ("us-gaap", "ProfitLoss"),
+        ("us-gaap", "ProfitLoss"),  # consolidated, incl. noncontrolling interests (flagged when used)
         ("ifrs-full", "ProfitLossAttributableToOwnersOfParent"),
         ("ifrs-full", "ProfitLoss"),
     ]),
+    "net_income_common": (FLOW, "currency", [
+        ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic"),
+        ("ifrs-full", "ProfitLossAttributableToOrdinaryEquityHoldersOfParentEntity"),
+    ]),
+    "preferred_dividends": (FLOW, "currency", [("us-gaap", "PreferredStockDividendsIncomeStatementImpact")]),
     "eps_diluted": (FLOW, "per_share", [
         ("us-gaap", "EarningsPerShareDiluted"),
         ("us-gaap", "EarningsPerShareBasicAndDiluted"),
@@ -58,11 +71,34 @@ METRICS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
         ("us-gaap", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"),
         ("ifrs-full", "CashFlowsFromUsedInOperatingActivities"),
     ]),
+    # Capital expenditure is often split across separate cash-flow lines (e.g. airlines tag aircraft
+    # purchases as PaymentsForFlightEquipment). Components are kept as separate metrics and combined
+    # in the snapshot (see financials.capex_total).
     "capex": (FLOW, "currency", [
         ("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment"),
-        ("us-gaap", "PaymentsToAcquireProductiveAssets"),
         ("us-gaap", "PaymentsForCapitalImprovements"),
         ("ifrs-full", "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"),
+    ]),
+    "capex_productive_assets": (FLOW, "currency", [("us-gaap", "PaymentsToAcquireProductiveAssets")]),
+    "capex_flight_equipment": (FLOW, "currency", [("us-gaap", "PaymentsForFlightEquipment")]),
+    "capex_oil_gas": (FLOW, "currency", [
+        ("us-gaap", "PaymentsToAcquireOilAndGasPropertyAndEquipment"),
+        ("us-gaap", "PaymentsToExploreAndDevelopOilAndGasProperties"),
+    ]),
+    "share_based_comp": (FLOW, "currency", [
+        ("us-gaap", "ShareBasedCompensation"), ("us-gaap", "AllocatedShareBasedCompensationExpense"),
+        ("ifrs-full", "AdjustmentsForSharebasedPayments"),
+    ]),
+    "depreciation": (FLOW, "currency", [
+        ("us-gaap", "DepreciationDepletionAndAmortization"), ("us-gaap", "DepreciationAndAmortization"),
+        ("us-gaap", "DepreciationAmortizationAndAccretionNet"), ("us-gaap", "Depreciation"),
+    ]),
+    "gain_on_property_sales": (FLOW, "currency", [
+        ("us-gaap", "GainsLossesOnSalesOfInvestmentRealEstate"),
+        ("us-gaap", "GainLossOnSaleOfPropertyPlantEquipment"),
+    ]),
+    "dividends_paid": (FLOW, "currency", [
+        ("us-gaap", "PaymentsOfDividendsCommonStock"), ("us-gaap", "PaymentsOfDividends"),
     ]),
     "diluted_shares": (FLOW, "shares", [
         ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
@@ -96,6 +132,14 @@ METRICS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
     ]),
     "stockholders_equity": (INSTANT, "currency", [
         ("us-gaap", "StockholdersEquity"), ("ifrs-full", "EquityAttributableToOwnersOfParent"),
+        ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+    ]),
+    "goodwill": (INSTANT, "currency", [("us-gaap", "Goodwill"), ("ifrs-full", "Goodwill")]),
+    "intangibles": (INSTANT, "currency", [
+        ("us-gaap", "IntangibleAssetsNetExcludingGoodwill"), ("us-gaap", "FiniteLivedIntangibleAssetsNet"),
+    ]),
+    "preferred_equity": (INSTANT, "currency", [
+        ("us-gaap", "PreferredStockValue"), ("us-gaap", "PreferredStockValueOutstanding"),
     ]),
     "shares_outstanding": (INSTANT, "shares", [
         ("dei", "EntityCommonStockSharesOutstanding"), ("us-gaap", "CommonStockSharesOutstanding"),

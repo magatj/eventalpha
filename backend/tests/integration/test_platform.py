@@ -233,7 +233,8 @@ def test_discovery_backtest_and_events_demo(client, run_jobs):
     assert growth == sorted(growth, reverse=True)
     ev = client.get("/api/events").json()
     assert ev["events"] and any(e["companies"] for e in ev["events"])
-    rp = client.get("/api/backtest/replay/NVDA?horizon=6").json()
+    top = d["items"][0]["ticker"]  # a stock this run actually analyzed (dynamic selection varies)
+    rp = client.get(f"/api/backtest/replay/{top}?horizon=6").json()
     assert rp["items"] and rp["summary"]["count"] == len(rp["items"])
     assert "benchmark_return" in rp["items"][0]
     bt = client.get("/api/backtest").json()
@@ -285,7 +286,8 @@ def test_discovery_selection_audit_and_unseen_stocks(client, run_jobs, monkeypat
     from app.config import get_settings
 
     s = get_settings()
-    for k, v in {"discovery_max_candidates": 10, "discovery_quota_baseline": 5, "discovery_quota_catalyst": 3,
+    for k, v in {"discovery_universe_mode": "fixed", "discovery_max_candidates": 10, "discovery_quota_baseline": 5,
+                 "discovery_quota_catalyst": 3,
                  "discovery_quota_underexplored": 2, "discovery_top_n": 5}.items():
         monkeypatch.setattr(s, k, v)
     set_mode(client, "demo")
@@ -293,7 +295,7 @@ def test_discovery_selection_audit_and_unseen_stocks(client, run_jobs, monkeypat
     run_jobs(5)
     assert client.get(f"/api/jobs/{r['job_id']}").json()["status"] == "succeeded"
 
-    audit = client.get("/api/discovery/candidates").json()
+    audit = client.get("/api/discovery/candidates?scope=all").json()
     rows = audit["candidates"]
     stats = audit["stats"]
     assert stats["universe"] == len(rows) >= 22  # every universe stock audited, selected or not

@@ -21,10 +21,11 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import Company, Forecast, ForecastScenario
-from app.services.analysis import BENCHMARK, get_company, historical_pe_band
+from app.services.analysis import BENCHMARK, company_splits, get_company
 from app.services.financials import build_snapshot, load_facts
-from app.services.forecasting.engine import ForecastEngine, ForecastInputs
+from app.services.forecasting.engine import ForecastEngine
 from app.services.forecasting.sectors import profile
+from app.services.forecasting.valuation_inputs import build_inputs
 from app.services.prices import annualized_volatility, beta_vs, load_adjusted_prices
 
 
@@ -110,6 +111,7 @@ def point_in_time_replay(session: Session, ticker: str, mode: str, horizon_month
     bench = get_company(session, BENCHMARK, mode)
     bench_df = load_adjusted_prices(session, bench.id) if bench else pd.DataFrame()
     facts = load_facts(session, company.id)
+    splits = company_splits(session, company.id)
     if prices.empty or not facts:
         return {"items": [], "summary": {"count": 0}, "error": "insufficient stored data"}
     last = prices.index[-1].date()
@@ -121,27 +123,19 @@ def point_in_time_replay(session: Session, ticker: str, mode: str, horizon_month
         if len(hist) < 120:
             d += timedelta(days=step_days)
             continue
-        snap = build_snapshot(facts, as_of=d)  # only facts filed on/before d
+        known = [f for f in facts if f.filed_date <= d]
+        snap = build_snapshot(known, as_of=d, splits=splits)  # only facts filed on/before d
         if not snap.has_data:
             d += timedelta(days=step_days)
             continue
         px = float(hist["close"].iloc[-1])
         px_date = hist.index[-1].date()
         bh = bench_df[bench_df.index <= pd.Timestamp(d)] if not bench_df.empty else bench_df
-        t = snap.ttm
-        inp = ForecastInputs(
-            ticker=ticker, price=px, price_date=px_date, sector=profile(company.sector),
-            revenue_ttm=t.get("revenue"), revenue_growth_yoy=snap.ratios.get("revenue_growth_yoy"),
-            revenue_cagr_3y=snap.ratios.get("revenue_cagr_3y"), net_margin=snap.ratios.get("net_margin"),
-            operating_margin=snap.ratios.get("operating_margin"), fcf_margin=snap.ratios.get("fcf_margin"),
-            eps_ttm=t.get("eps"), shares=t.get("diluted_shares"), share_change_rate=snap.ratios.get("share_change_rate"),
-            cash=t.get("cash_and_investments"), debt=t.get("total_debt"), margin_history=snap.margin_history,
-            beta=beta_vs(hist["close"], bh["close"]) if not bh.empty else None,
-            volatility=annualized_volatility(hist["close"]),
-            historical_pe_band=historical_pe_band([f for f in facts if f.filed_date <= d], hist),
-            currency_ok=snap.currency == "USD" and not snap.foreign_issuer, risk_free_rate=s.risk_free_rate,
-            equity_risk_premium=s.equity_risk_premium, pre_tax_cost_of_debt=s.pre_tax_cost_of_debt, tax_rate=s.tax_rate,
-        )
+        inp, _ = build_inputs(
+            None, ticker=ticker, mode=mode, sector_name=company.sector, sector=profile(company.sector),
+            sic=company.sic_code, industry=company.industry, snap=snap, facts=known, prices=hist, price=px,
+            price_date=px_date, beta=beta_vs(hist["close"], bh["close"]) if not bh.empty else None,
+            volatility=annualized_volatility(hist["close"]), splits=splits, settings=s, use_peers=False)
         hf = ForecastEngine(inp).run(horizon_months)
         p1 = price_on_or_after(prices, hf.target_date)
         b0 = price_on_or_before(bench_df, px_date) if not bench_df.empty else None
@@ -159,4 +153,5 @@ def point_in_time_replay(session: Session, ticker: str, mode: str, horizon_month
             })
         d += timedelta(days=step_days)
     return {"ticker": ticker, "items": items, "summary": summarize(items),
-            "method": "Point-in-time replay: prices ≤ as-of date, SEC facts filed ≤ as-of date, no AI adjustments."}
+            "method": "Point-in-time replay: prices ≤ as-of date, SEC facts filed ≤ as-of date, company-history multiples "
+                      "as of that date (no peers, which are not point-in-time), no AI adjustments."}

@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -26,6 +26,7 @@ from app.models import (
     Analysis,
     AnalysisSource,
     Company,
+    CorporateAction,
     Event,
     EventCompanyRelationship,
     Forecast,
@@ -45,9 +46,10 @@ from app.services.forecasting.engine import (
     ForecastEngine,
     ForecastInputs,
     HorizonForecast,
-    run_all_horizons,
 )
 from app.services.forecasting.sectors import profile, sector_from_sic
+from app.services.forecasting.valuation_guardrails import INVALID, UNSUPPORTED
+from app.services.forecasting.valuation_inputs import assess, audit_record, build_inputs
 from app.services.http import DataUnavailable, ProviderError, ProviderNotConfigured
 from app.services.market_calendar import last_completed_session, trading_days_stale
 from app.services.prices import (
@@ -215,13 +217,21 @@ def ensure_benchmark(session: Session, mode: DataMode, provider: MarketDataProvi
 # ---------------------------------------------------------------------------------
 # metric helpers
 # ---------------------------------------------------------------------------------
-def historical_pe_band(facts: list, prices: pd.DataFrame) -> tuple[float, float, float] | None:
+def company_splits(session: Session, company_id: int) -> list[tuple[date, float]]:
+    """(ex_date, new shares per old share) for every recorded split of the company."""
+    return [(a.ex_date, a.split_to / a.split_from) for a in session.scalars(select(CorporateAction).where(
+        CorporateAction.company_id == company_id, CorporateAction.action_type == "split"))
+        if a.split_from and a.split_to]
+
+
+def historical_pe_band(facts: list, prices: pd.DataFrame,
+                       splits: list[tuple[date, float]] | None = None) -> tuple[float, float, float] | None:
     if prices.empty:
         return None
     month_ends = prices["close"].resample("ME").last().dropna().tail(24)
     pes = []
     for ts, px in month_ends.items():
-        snap = build_snapshot(facts, as_of=ts.date())
+        snap = build_snapshot(facts, as_of=ts.date(), splits=splits)
         eps = snap.ttm.get("eps")
         if eps and eps > 0:
             pes.append(px / eps)
@@ -239,7 +249,9 @@ def risk_rating(vol: float | None, bear_return: float | None, net_margin: float 
             pts, why = pts + 2, why + [f"high volatility ({vol:.0%})"]
         elif vol > 0.30:
             pts, why = pts + 1, why + [f"elevated volatility ({vol:.0%})"]
-    if bear_return is not None:
+    if bear_return is None:
+        pts, why = pts + 1, why + ["downside not quantified (no valid valuation)"]
+    else:
         if bear_return < -0.40:
             pts, why = pts + 2, why + [f"deep bear-case downside ({bear_return:.0%})"]
         elif bear_return < -0.25:
@@ -310,7 +322,9 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
     progress("Retrieving SEC financial statements")
     fin_meta = refresh_financials(session, company, mode, warnings)
     facts = load_facts(session, company.id)
-    snap: FinancialSnapshot = build_snapshot(facts, as_of=date.today(), currency=fin_meta.get("currency", "USD"))
+    splits = company_splits(session, company.id)
+    snap: FinancialSnapshot = build_snapshot(facts, as_of=date.today(), currency=fin_meta.get("currency", "USD"),
+                                             splits=splits)
     warnings.extend(snap.warnings)
 
     progress("Collecting news, filings and catalysts")
@@ -357,7 +371,6 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
     bench_px = load_adjusted_prices(session, bench.id, start=date.today() - timedelta(days=HISTORY_DAYS + 30))
     stats = price_stats(prices)
     beta = beta_vs(prices["close"], bench_px["close"]) if not bench_px.empty else None
-    pe_band = historical_pe_band(facts, prices)
     sector = profile(company.sector)
     t = snap.ttm
     cash, debt = t.get("cash_and_investments"), t.get("total_debt")
@@ -400,19 +413,15 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
                                "event_type": e.event_type, "source_id": sid, "event_id": e.id})
 
     # ---- baseline quant (no AI adjustments) to inform rule-based / AI --------------
+    # evidence-based valuation inputs: method registry, company history, peers, sector models
+    base_inputs, vctx = build_inputs(
+        session, ticker=ticker, mode=mode, sector_name=company.sector, sector=sector, sic=company.sic_code,
+        industry=company.industry, snap=snap, facts=facts, prices=prices, price=last_px, price_date=last_date,
+        beta=beta, volatility=stats.get("volatility_1y"), splits=splits, settings=settings,
+        provider_shares=company.shares_outstanding)
+
     def inputs(adjs: list[AIAdjustment]) -> ForecastInputs:
-        return ForecastInputs(
-            ticker=ticker, price=last_px, price_date=last_date, sector=sector,
-            revenue_ttm=t.get("revenue"), revenue_growth_yoy=snap.ratios.get("revenue_growth_yoy"),
-            revenue_cagr_3y=snap.ratios.get("revenue_cagr_3y"), net_margin=snap.ratios.get("net_margin"),
-            operating_margin=snap.ratios.get("operating_margin"), fcf_margin=snap.ratios.get("fcf_margin"),
-            eps_ttm=eps, shares=t.get("diluted_shares") or company.shares_outstanding,
-            share_change_rate=snap.ratios.get("share_change_rate"), cash=cash, debt=debt,
-            margin_history=snap.margin_history, beta=beta, volatility=stats.get("volatility_1y"),
-            historical_pe_band=pe_band, currency_ok=snap.currency == "USD" and not snap.foreign_issuer,
-            risk_free_rate=settings.risk_free_rate, equity_risk_premium=settings.equity_risk_premium,
-            pre_tax_cost_of_debt=settings.pre_tax_cost_of_debt, tax_rate=settings.tax_rate, ai_adjustments=adjs,
-        )
+        return replace(base_inputs, ai_adjustments=adjs)
 
     base_engine = ForecastEngine(inputs([]))
     baseline = {h: base_engine.run(h) for h in HORIZONS_MONTHS}
@@ -425,6 +434,8 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
         "fcf_margin": snap.ratios.get("fcf_margin"), "free_cash_flow_ttm": t.get("free_cash_flow"),
         "cash": cash, "debt": debt, "net_cash": net_cash, "pe_ttm": (last_px / eps) if eps and eps > 0 else None,
         "pe_band": [round(x, 2) for x in base_engine.pe_band],
+        "valuation_method": vctx.plan.method, "market_cap": vctx.market_cap,
+        "market_cap_basis": vctx.market_cap_basis if vctx.market_cap else None,
         "volatility_1y": stats.get("volatility_1y"), "beta": beta,
         "base_return_12m": b12["base"].potential_return, "bear_return_12m": b12["bear"].potential_return,
         "sector": company.sector, "fiscal_currency": snap.currency,
@@ -464,8 +475,24 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
     adjs = [AIAdjustment(scenario=a["scenario"], revenue_growth_pp=a["revenue_growth_adjustment_pp"],
                          net_margin_pp=a["net_margin_adjustment_pp"], rationale=a["rationale"],
                          source_labels=a["source_ids"]) for a in thesis.get("assumption_suggestions", [])]
-    horizons: list[HorizonForecast] = run_all_horizons(inputs(adjs)) if adjs else list(baseline.values())
+    final_engine = ForecastEngine(inputs(adjs)) if adjs else base_engine
+    horizons: list[HorizonForecast] = [final_engine.run(h) for h in HORIZONS_MONTHS] if adjs else list(baseline.values())
     h12 = next(h for h in horizons if h.horizon_months == 12)
+    # guardrails: is the result supported by its assumptions? (audit kept whatever the outcome)
+    guard = assess(vctx, h12, snap, sorted(set(final_engine.flags)), settings)
+    valuation = audit_record(vctx, guard, h12, snap, last_date, MODEL_VERSION)
+    if guard.status in (INVALID, UNSUPPORTED):
+        reason = "invalid inputs" if guard.status == INVALID else "no suitable valuation method for the available data"
+        warnings.append(f"Price targets withheld: {reason} (see the valuation audit).")
+        for h in horizons:
+            for sc in h.scenarios.values():
+                if sc.target_price is not None:
+                    sc.details["withheld_target"] = sc.target_price
+                sc.target_price = sc.target_price_pe = sc.target_price_dcf = sc.target_price_ev_sales = None
+                sc.potential_return = None
+    elif guard.status == "requires_review":
+        warnings.append("Forecast requires review: the result is not fully supported by its assumptions "
+                        "(excluded from ranked recommendations; see the valuation audit).")
     base_r, bear_r = h12.scenarios["base"].potential_return, h12.scenarios["bear"].potential_return
     rating, rating_why = risk_rating(stats.get("volatility_1y"), bear_r, snap.ratios.get("net_margin"), net_cash,
                                      t.get("net_income"), stale)
@@ -475,7 +502,8 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
         "bull_return_12m": h12.scenarios["bull"].potential_return,
         "base_target_12m": h12.scenarios["base"].target_price, "bear_target_12m": h12.scenarios["bear"].target_price,
         "bull_target_12m": h12.scenarios["bull"].target_price,
-        "outlook": quant_outlook(base_r, bear_r), "ai_outlook": thesis.get("outlook"),
+        "outlook": quant_outlook(base_r, bear_r) if guard.status not in (INVALID, UNSUPPORTED) else "neutral",
+        "ai_outlook": thesis.get("outlook"), "valuation_status": guard.status,
         "risk_rating": rating, "risk_reasons": rating_why, "price_stats": stats, "stale_sessions": stale,
         "bullish_points": [c["text"] for c in thesis.get("bullish_arguments", [])][:6],
         "bearish_points": [c["text"] for c in thesis.get("bearish_arguments", [])][:6],
@@ -489,7 +517,7 @@ def analyze_ticker(session: Session, raw_ticker: str, mode: DataMode, force: boo
         observed_price_date=last_date, ai_kind=ai_kind, ai_model=ai_model, prompt_version=prompt_version,
         thesis=thesis, snapshot=_jsonable(snapshot), usage=_jsonable(usage), cost_usd=cost,
         financial_data_version=snap.financial_data_version, forecast_model_version=MODEL_VERSION,
-        warnings=list(dict.fromkeys(warnings)),
+        warnings=list(dict.fromkeys(warnings)), valuation_status=guard.status, valuation=_jsonable(valuation),
     )
     session.add(analysis)
     session.flush()
@@ -549,3 +577,30 @@ def _default(o: Any) -> Any:
     if hasattr(o, "__dict__"):
         return o.__dict__
     return str(o)
+
+
+def stored_forecast_inputs(session: Session, company: Company, analysis: Analysis) -> ForecastInputs:
+    """Rebuild the engine inputs of a stored analysis from stored data only (no provider calls), using the
+    same builder as analyze_ticker and the analysis' own AI adjustments. Used for what-if scenarios."""
+    settings = get_settings()
+    facts = load_facts(session, company.id)
+    splits = company_splits(session, company.id)
+    snap = build_snapshot(facts, as_of=analysis.observed_price_date or date.today(), splits=splits)
+    prices = load_adjusted_prices(session, company.id, start=(analysis.observed_price_date or date.today())
+                                  - timedelta(days=HISTORY_DAYS + 30), end=analysis.observed_price_date)
+    if prices.empty:
+        raise AnalysisError(f"No stored prices for {company.ticker}.", "no_price_data")
+    bench = get_company(session, BENCHMARK, analysis.data_mode)
+    bench_px = load_adjusted_prices(session, bench.id, start=prices.index[0].date()) if bench else pd.DataFrame()
+    stats = price_stats(prices)
+    inp, _ = build_inputs(
+        session, ticker=company.ticker, mode=analysis.data_mode, sector_name=company.sector,
+        sector=profile(company.sector), sic=company.sic_code, industry=company.industry, snap=snap, facts=facts,
+        prices=prices, price=float(analysis.observed_price), price_date=analysis.observed_price_date,
+        beta=beta_vs(prices["close"], bench_px["close"]) if not bench_px.empty else None,
+        volatility=stats.get("volatility_1y"), splits=splits, settings=settings,
+        provider_shares=company.shares_outstanding)
+    adjs = [AIAdjustment(scenario=x["scenario"], revenue_growth_pp=x["revenue_growth_adjustment_pp"],
+                         net_margin_pp=x["net_margin_adjustment_pp"], rationale=x["rationale"], source_labels=x["source_ids"])
+            for x in (analysis.thesis or {}).get("assumption_suggestions", [])]
+    return replace(inp, ai_adjustments=adjs)

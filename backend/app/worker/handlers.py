@@ -11,15 +11,29 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import AnalysisJob, Event, HttpCache
+from app.models import AnalysisJob, Company, Event, HttpCache
 from app.services.ai import AIEngine
 from app.services.analysis import analyze_ticker
 from app.services.baseline import refresh_baseline
 from app.services.discovery import run_discovery
+from app.services.filings_index import ingest_filing_indexes
 from app.services.http import ProviderError, ProviderNotConfigured
-from app.services.market_calendar import last_completed_session
+from app.services.market_calendar import last_completed_session, previous_session
+from app.services.market_screen import (
+    coverage_stats,
+    persist_screen,
+    refresh_fundamentals,
+    refresh_market_bars,
+    screen,
+)
+from app.services.master_universe import make_resolver, refresh_master_universe
 from app.services.prices import upsert_prices
 from app.services.providers import market_provider
+from app.services.screen_coverage import (
+    refresh_fundamentals_fallback,
+    refresh_market_splits,
+    refresh_provider_shares,
+)
 from app.services.universe import ensure_universe_companies, universe_tickers, watchlist_tickers
 from app.services.universe_news import ingest_universe_filings, ingest_universe_news
 
@@ -39,14 +53,50 @@ def _universe(session: Session, mode: str):
     return ensure_universe_companies(session, mode, tickers)
 
 
+def _dynamic() -> bool:
+    return get_settings().discovery_universe_mode == "dynamic"
+
+
 def h_ingest_news(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
-    """Company news for the whole universe (market-wide feed + rotating per-ticker checks) + macro RSS."""
-    return ingest_universe_news(session, job.data_mode, _universe(session, job.data_mode), progress=progress)
+    """Market-wide news (+ rotating per-ticker checks for monitored stocks) + macro RSS. In dynamic
+    mode, news can link any listed stock, including ones never monitored."""
+    resolver = known = None
+    if _dynamic():
+        resolver, known = make_resolver(session, job.data_mode)
+    return ingest_universe_news(session, job.data_mode, _universe(session, job.data_mode), progress=progress,
+                                resolver=resolver, known_tickers=known)
 
 
 def h_refresh_baseline(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
-    """Prices, liquidity and SEC financials for every universe stock (pre-selection baseline)."""
-    return refresh_baseline(session, job.data_mode, _universe(session, job.data_mode), progress)
+    """Daily market data. Dynamic: market-wide grouped-daily prices + SEC frames + screening.
+    Fixed: baseline for the universe.txt stocks."""
+    if not _dynamic():
+        return refresh_baseline(session, job.data_mode, _universe(session, job.data_mode), progress)
+    out = {"prices": refresh_market_bars(session, job.data_mode, progress),
+           "fundamentals": refresh_fundamentals(session, job.data_mode, progress)}
+    for name, fn in (("splits", lambda: refresh_market_splits(session, job.data_mode)),
+                     ("fundamentals_fallback", lambda: refresh_fundamentals_fallback(session, job.data_mode, progress)),
+                     ("provider_shares", lambda: refresh_provider_shares(session, job.data_mode, progress))):
+        try:  # coverage improvements are optional: never block the daily screen
+            out[name] = fn()
+        except Exception as exc:
+            session.rollback()
+            out[name] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    results = screen(session, job.data_mode, progress=progress)
+    persist_screen(session, results)
+    out["screened"] = len(results)
+    out["eligible"] = sum(1 for r in results if r.status in ("eligible", "catalyst_eligible"))
+    out["coverage"] = coverage_stats(results)
+    return out
+
+
+def h_refresh_universe(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
+    """Weekly: master universe of US-listed securities, plus a larger batch of provider share counts
+    for securities whose market cap is still unknown (Sunday morning, when nothing else runs)."""
+    out = refresh_master_universe(session, job.data_mode, progress)
+    out["provider_shares"] = refresh_provider_shares(session, job.data_mode, progress,
+                                                     budget=get_settings().provider_shares_per_run * 6)
+    return out
 
 
 def h_refresh_prices(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
@@ -57,24 +107,45 @@ def h_refresh_prices(session: Session, job: AnalysisJob, progress: Progress) -> 
         return {"skipped": exc.message}
     day = last_completed_session()
     tickers = list(dict.fromkeys(universe_tickers(job.data_mode) + watchlist_tickers(session, job.data_mode) + ["SPY"]))
+    if _dynamic():  # every company that has been analyzed or linked (one grouped request covers all)
+        tickers += [t for (t,) in session.execute(select(Company.ticker).where(Company.data_mode == job.data_mode))]
+        tickers = list(dict.fromkeys(tickers))
     companies = ensure_universe_companies(session, job.data_mode, tickers)
     if prov.is_demo:
         n = 0
         for t, c in companies.items():
             n += upsert_prices(session, c.id, prov.get_historical_prices(t, day - timedelta(days=10), day), prov.name)
         return {"session": str(day), "rows": n}
-    grouped = prov.get_grouped_daily(day)
+    note = None
+    try:
+        grouped = prov.get_grouped_daily(day)
+    except ProviderError as exc:
+        if exc.status != 403 or "end of day" not in exc.message:
+            raise
+        # Free plans release a session's end-of-day data some hours after the close. Keep the previous
+        # session (already stored) and let the overnight catch-up job fetch this one.
+        note = f"{day} end-of-day data not yet released by the provider plan; using {previous_session(day)}"
+        day = previous_session(day)
+        grouped = prov.get_grouped_daily(day)
     n = 0
     for t, c in companies.items():
         bar = grouped.get(t) or grouped.get(t.replace("-", "."))
         if bar:
             n += upsert_prices(session, c.id, [bar], prov.name)
-    return {"session": str(day), "rows": n, "missing": [t for t in companies if t not in grouped][:50]}
+    out = {"session": str(day), "rows": n, "missing": [t for t in companies if t not in grouped][:50]}
+    if note:
+        out["note"] = note
+    return out
 
 
 def h_sec_monitor(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
-    """SEC filings + estimated earnings dates for every universe company."""
-    return ingest_universe_filings(session, job.data_mode, _universe(session, job.data_mode), progress=progress)
+    """SEC filings + estimated earnings dates for monitored companies; in dynamic mode also the
+    market-wide EDGAR daily index (every 8-K/10-Q/10-K by any listed company)."""
+    out = {"monitored": ingest_universe_filings(session, job.data_mode, _universe(session, job.data_mode),
+                                                progress=progress)}
+    if _dynamic():
+        out["market_wide"] = ingest_filing_indexes(session, job.data_mode, progress)
+    return out
 
 
 def h_catalyst_analysis(session: Session, job: AnalysisJob, progress: Progress) -> dict[str, Any]:
@@ -142,6 +213,7 @@ HANDLERS: dict[str, Callable[[Session, AnalysisJob, Progress], dict[str, Any]]] 
     "analyze_ticker": h_analyze,
     "ingest_news": h_ingest_news,
     "refresh_baseline": h_refresh_baseline,
+    "refresh_universe": h_refresh_universe,
     "refresh_prices": h_refresh_prices,
     "sec_monitor": h_sec_monitor,
     "catalyst_analysis": h_catalyst_analysis,

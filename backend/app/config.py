@@ -49,6 +49,19 @@ class Settings(BaseSettings):
     ai_monthly_budget_usd: float = 10.0
     ai_cache_ttl_hours: int = 24
     ai_max_sources: int = 20
+    # AI research chat (stock detail page). The key stays on the backend; spend is tracked in ai_usage.
+    openai_chat_model: str = "gpt-5-mini"
+    openai_chat_input_price_per_m: float = 0.25
+    openai_chat_output_price_per_m: float = 2.00
+    chat_max_context_tokens: int = 12000  # EventAlpha data placed in the prompt (approx., 4 chars/token)
+    chat_max_output_tokens: int = 4000  # includes hidden reasoning tokens on reasoning models
+    chat_reasoning_effort: str = "low"  # reasoning models only (gpt-5*, o*): minimal | low | medium | high
+    chat_monthly_budget_usd: float = 5.0  # chat-only cap, inside the overall AI_MONTHLY_BUDGET_USD
+    chat_max_history_messages: int = 10  # older turns are folded into a compact summary
+    chat_max_tool_rounds: int = 4
+    chat_max_message_chars: int = 2000
+    chat_rate_limit_per_minute: int = 12
+    chat_stale_analysis_days: int = 7
 
     # Forecasting assumptions
     risk_free_rate: float = 0.0425
@@ -64,6 +77,35 @@ class Settings(BaseSettings):
     discovery_quota_catalyst: int = 15
     discovery_quota_underexplored: int = 10
     news_rotation_per_run: int = 6  # per-ticker Massive news requests per ingestion run
+
+    # Dynamic market-wide discovery (feature flag: "dynamic" | "fixed"; fixed = universe.txt only)
+    discovery_universe_mode: Literal["dynamic", "fixed"] = "dynamic"
+    universe_security_types: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["CS", "OS", "ADRC"])
+    universe_exchanges: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["XNYS", "XNAS", "XASE"])
+    universe_refresh_days: int = 7
+    screen_min_market_cap: float = 500_000_000.0
+    screen_max_price_staleness: int = 5  # trading sessions
+    screen_min_price_sessions: int = 20
+    screen_history_sessions: int = 63  # grouped-daily sessions kept for momentum/volatility
+    catalyst_min_market_cap: float = 100_000_000.0  # smaller companies need an exceptional catalyst
+    catalyst_min_avg_dollar_volume: float = 5_000_000.0
+    catalyst_min_materiality: float = 0.7
+    dynamic_quota_financial: int = 25
+    dynamic_quota_valuation: int = 15
+    dynamic_quota_catalyst: int = 15
+    dynamic_quota_underexplored: int = 5
+    discovery_min_publish_score: float = 50.0  # publish fewer than top_n if quality is insufficient
+    sic_enrich_per_run: int = 2500  # SEC submissions lookups (sector) per screening run
+    filing_index_lookback_days: int = 5
+    # valuation guardrails (upside is never capped; unsupported results are routed to review)
+    valuation_upside_review_threshold: float = 1.0  # base 12m upside above this needs supporting evidence
+    valuation_max_unsupported_rerating: float = 0.5  # base multiple > current x (1 + this) needs historical support
+    # screening data coverage (SEC companyfacts fallback and provider share counts; both bounded per run)
+    fundamentals_fallback_per_run: int = 400  # companyfacts lookups for liquid securities missing frames data
+    fundamentals_fallback_max_age_days: int = 30
+    fundamentals_fallback_min_dollar_volume: float = 5e6
+    provider_shares_per_run: int = 25  # Massive ticker-details lookups (free tier: 5/min) for missing market caps
+    provider_shares_max_age_days: int = 30
     min_avg_dollar_volume: float = 20_000_000.0
 
     # Scheduler / worker
@@ -85,7 +127,7 @@ class Settings(BaseSettings):
 
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
 
-    @field_validator("cors_origins", "rss_feeds", mode="before")
+    @field_validator("cors_origins", "rss_feeds", "universe_security_types", "universe_exchanges", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):

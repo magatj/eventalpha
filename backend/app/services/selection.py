@@ -23,6 +23,10 @@ from datetime import datetime
 
 PATHWAYS = ("baseline_leader", "new_catalyst", "underexplored")
 DEFAULT_QUOTAS: dict[str, int] = {"baseline_leader": 35, "new_catalyst": 15, "underexplored": 10}
+# Dynamic (market-wide) mode
+DYNAMIC_PATHWAYS = ("financial_leader", "valuation_opportunity", "new_catalyst", "underexplored")
+DYNAMIC_QUOTAS: dict[str, int] = {"financial_leader": 25, "valuation_opportunity": 15, "new_catalyst": 15,
+                                  "underexplored": 5}
 REFILL = "refill"
 SCORE_DECIMALS = 4  # baseline scores equal to 4 decimals are treated as tied
 
@@ -40,6 +44,13 @@ class UniverseItem:
     ineligible_reason: str | None = None
     company_id: int | None = None
     data_timestamps: dict = field(default_factory=dict)
+    # dynamic mode
+    security_id: int | None = None
+    financial_score: float | None = None
+    valuation_score: float | None = None
+    completeness: float = 1.0
+    newly_eligible: bool = False
+    ever_candidate: bool = False
 
 
 @dataclass
@@ -74,34 +85,58 @@ def rank_baseline(items: Iterable[UniverseItem], seed: str) -> list[UniverseItem
 def rank_new_catalysts(items: Iterable[UniverseItem], seed: str, new_since: datetime) -> list[UniverseItem]:
     fresh = [i for i in items if i.catalyst_status == "detected" and i.catalyst_first_seen
              and i.catalyst_first_seen >= new_since]
-    return sorted(fresh, key=lambda i: (-_r(i.catalyst_score), -_r(i.baseline_score), tie_key(seed, i.ticker)))
-
-
-def rank_underexplored(items: Iterable[UniverseItem], seed: str) -> list[UniverseItem]:
-    # never analyzed first, then least recently analyzed; ties rotate by seed
-    return sorted(items, key=lambda i: (i.last_analyzed_at is not None,
-                                        i.last_analyzed_at.timestamp() if i.last_analyzed_at else 0.0,
+    # Materiality first (2-decimal buckets), then companies never in a candidate pool before.
+    return sorted(fresh, key=lambda i: (-round(i.catalyst_score or 0.0, 2), i.ever_candidate,
+                                        -_r(i.baseline_score if i.baseline_score is not None else i.financial_score),
                                         tie_key(seed, i.ticker)))
 
 
+def rank_underexplored(items: Iterable[UniverseItem], seed: str, min_completeness: float = 0.0,
+                       stale_before: datetime | None = None) -> list[UniverseItem]:
+    """Never analyzed first (newly eligible ones before the rest), then least recently analyzed;
+    ties rotate by seed. Optionally require adequate data and no recent analysis. This only
+    reserves analysis capacity; it never changes the investment score."""
+    pool = [i for i in items if i.completeness >= min_completeness
+            and (stale_before is None or i.last_analyzed_at is None or i.last_analyzed_at < stale_before)]
+    return sorted(pool, key=lambda i: (i.last_analyzed_at is not None, not i.newly_eligible,
+                                       i.last_analyzed_at.timestamp() if i.last_analyzed_at else 0.0,
+                                       tie_key(seed, i.ticker)))
+
+
+def rank_financial(items: Iterable[UniverseItem], seed: str) -> list[UniverseItem]:
+    return sorted(items, key=lambda i: (-_r(i.financial_score), -_r(i.completeness), tie_key(seed, i.ticker)))
+
+
+def rank_valuation(items: Iterable[UniverseItem], seed: str) -> list[UniverseItem]:
+    pool = [i for i in items if i.valuation_score is not None]
+    return sorted(pool, key=lambda i: (-_r(i.valuation_score), -_r(i.financial_score), tie_key(seed, i.ticker)))
+
+
 def select_candidates(items: list[UniverseItem], seed: str, new_since: datetime, total: int = 60,
-                      quotas: dict[str, int] | None = None) -> SelectionResult:
+                      quotas: dict[str, int] | None = None, underexplored_min_completeness: float = 0.0,
+                      underexplored_stale_before: datetime | None = None) -> SelectionResult:
+    """Fill pathways in the order given by `quotas`, dedupe, then refill from the first pathway."""
     quotas = dict(quotas or DEFAULT_QUOTAS)
+    order = list(quotas)
     eligible = [i for i in items if i.eligible]
-    rankings = {
-        "baseline_leader": rank_baseline(eligible, seed),
-        "new_catalyst": rank_new_catalysts(eligible, seed, new_since),
-        "underexplored": rank_underexplored(eligible, seed),
+    rank_fns = {
+        "baseline_leader": lambda: rank_baseline(eligible, seed),
+        "financial_leader": lambda: rank_financial(eligible, seed),
+        "valuation_opportunity": lambda: rank_valuation(eligible, seed),
+        "new_catalyst": lambda: rank_new_catalysts(eligible, seed, new_since),
+        "underexplored": lambda: rank_underexplored(eligible, seed, underexplored_min_completeness,
+                                                    underexplored_stale_before),
     }
+    rankings = {p: rank_fns[p]() for p in order}
     qualifying: dict[str, list[str]] = {}
-    for p in PATHWAYS:
+    for p in order:
         for i in rankings[p][: quotas.get(p, 0)]:
             qualifying.setdefault(i.ticker, []).append(p)
 
     taken: set[str] = set()
     selected: list[tuple[str, str]] = []
-    filled = {p: 0 for p in (*PATHWAYS, REFILL)}
-    for p in PATHWAYS:
+    filled = {p: 0 for p in (*order, REFILL)}
+    for p in order:
         for i in rankings[p]:
             if filled[p] >= quotas.get(p, 0) or len(selected) >= total:
                 break
@@ -110,7 +145,7 @@ def select_candidates(items: list[UniverseItem], seed: str, new_since: datetime,
             taken.add(i.ticker)
             selected.append((i.ticker, p))
             filled[p] += 1
-    for i in rankings["baseline_leader"]:  # refill unused slots
+    for i in rankings[order[0]]:  # refill unused slots from the primary pathway
         if len(selected) >= total:
             break
         if i.ticker not in taken:

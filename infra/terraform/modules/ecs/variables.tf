@@ -131,6 +131,16 @@ variable "ai_monthly_budget_usd" {
   default = 10
 }
 
+variable "openai_chat_model" {
+  type    = string
+  default = "gpt-5-mini"
+}
+
+variable "chat_monthly_budget_usd" {
+  type    = number
+  default = 5
+}
+
 variable "cors_origins" {
   type    = list(string)
   default = []

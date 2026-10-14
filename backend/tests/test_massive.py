@@ -80,9 +80,36 @@ def test_news_parsing_skips_invalid_items(fixture):
     assert news[0].sentiment == {"NKE": "positive"}
 
 
-def test_market_indices_are_labeled_etf_proxies(fixture):
-    p = provider({"/v2/aggs/ticker/SPY": fixture("massive_aggs.json"), "/v2/aggs/ticker/QQQ": 500})
-    quotes = {q.symbol: q for q in p.get_market_indices()}
-    assert quotes["SPY"].kind == "etf_proxy" and quotes["SPY"].proxy_for == "S&P 500"
-    assert quotes["SPY"].value == 131.9
-    assert quotes["QQQ"].value is None and quotes["QQQ"].unavailable_reason  # failure shown, not fabricated
+def test_dashboard_shows_actual_index_levels_not_etfs(fixture, monkeypatch):
+    from app.providers.market import fred
+
+    monkeypatch.setattr(fred.FredIndexSource, "latest", lambda self, series, lookback_days=21: {
+        "SP500": (date(2026, 10, 12), 7807.24, 7811.54), "DJIA": (date(2026, 10, 13), 51670.10, 51850.55)})
+    p = provider({"/v2/aggs/ticker/I:NDX": fixture("massive_aggs.json")})
+    q = {x.symbol: x for x in p.get_market_indices()}
+    assert q["SPX"].kind == "index" and q["SPX"].source == "fred" and q["SPX"].value == 7807.24
+    assert q["SPX"].change_pct == pytest.approx(7807.24 / 7811.54 - 1) and q["SPX"].as_of_date == date(2026, 10, 12)
+    assert q["DJI"].kind == "index" and q["DJI"].value == 51670.10 and q["DJI"].proxy_for is None
+    assert q["NDX"].kind == "index" and q["NDX"].source == "massive"  # entitled on the free plan
+
+
+def test_etf_is_only_a_labeled_fallback_and_failures_are_not_fabricated(fixture, monkeypatch):
+    from app.providers.market import fred
+
+    def fail(self, series, lookback_days=21):
+        raise DataUnavailable("fred", "FRED unreachable")
+
+    monkeypatch.setattr(fred.FredIndexSource, "latest", fail)
+    p = provider({"/v2/aggs/ticker/SPY": fixture("massive_aggs.json"), "/v2/aggs/ticker/I:NDX": 500,
+                  "/v2/aggs/ticker/QQQ": 500, "/v2/aggs/ticker/DIA": 500})
+    q = {x.name if x.kind == "index" else x.proxy_for: x for x in p.get_market_indices()}
+    spx = q["S&P 500"]
+    assert spx.kind == "etf_proxy" and spx.symbol == "SPY" and spx.value == 131.9 and "FRED unreachable" in spx.unavailable_reason
+    assert q["Nasdaq-100"].value is None and q["Nasdaq-100"].unavailable_reason  # shown as unavailable
+
+
+def test_fred_csv_skips_unpublished_sessions():
+    from app.providers.market.fred import parse_fred_csv
+
+    d = parse_fred_csv("observation_date,SP500,DJIA\n2026-10-12,7807.24,51850.55\n2026-10-13,,51670.10\n")
+    assert d["SP500"] == [(date(2026, 10, 12), 7807.24)] and d["DJIA"][-1] == (date(2026, 10, 13), 51670.10)

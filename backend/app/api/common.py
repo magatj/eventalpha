@@ -99,7 +99,8 @@ def analysis_summary(a: Analysis) -> dict[str, Any]:
         "outlook": s.get("outlook"), "ai_outlook": s.get("ai_outlook"), "risk_rating": s.get("risk_rating"),
         "base_target_12m": s.get("base_target_12m"), "bear_target_12m": s.get("bear_target_12m"),
         "bull_target_12m": s.get("bull_target_12m"), "base_return_12m": s.get("base_return_12m"),
-        "forecast_model_version": a.forecast_model_version,
+        "forecast_model_version": a.forecast_model_version, "valuation_status": a.valuation_status,
+        "valuation_method": (a.valuation or {}).get("method_label"),
     }
 
 

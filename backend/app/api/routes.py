@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import delete, or_, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.api.common import (
@@ -36,6 +36,7 @@ from app.models import (
     Forecast,
     NewsArticle,
     Recommendation,
+    Security,
     WatchlistItem,
 )
 from app.services import jobs
@@ -100,14 +101,29 @@ def discovery(
     if run is None:
         return {"data_mode": mode, "run": None, "items": [], "running_job": _job_dict(running) if running else None}
     items = []
+    cand = {c.company_id: c for c in db.scalars(select(DiscoveryCandidate).where(
+        DiscoveryCandidate.run_id == run.id, DiscoveryCandidate.selected))}
     for r in db.scalars(select(Recommendation).where(Recommendation.run_id == run.id).order_by(Recommendation.rank)):
         c = r.company
+        dc = cand.get(r.company_id)
+        sm = (dc.screen_metrics if dc else None) or {}
+        cat_ev = db.get(Event, r.catalyst_event_id) if r.catalyst_event_id else None
+        fac = (r.factors or {}).get("factors", {})
         a = db.get(Analysis, r.analysis_id) if r.analysis_id else None
         f = db.get(Forecast, r.forecast_id) if r.forecast_id else None
         base = next((s for s in f.scenarios if s.scenario == "base"), None) if f else None
         items.append({
-            "rank": r.rank, "ticker": c.ticker, "name": c.name, "sector": c.sector,
-            "latest_price": latest_price(db, c.id), "score": r.score, "score_band": r.score_band, "factors": r.factors,
+            "rank": r.rank, "ticker": c.ticker, "name": c.name, "sector": c.sector or sm.get("sector"),
+            "latest_price": latest_price(db, c.id), "score": r.score,
+            "score_display": round((r.score or 0) / 5) * 5, "score_band": r.score_band, "factors": r.factors,
+            "market_cap": dc.market_cap if dc else None, "size": sm.get("size"),
+            "financial_strength": fac.get("financial_strength"), "valuation": fac.get("valuation"),
+            "data_completeness": (r.factors or {}).get("data_completeness"),
+            "catalyst_category": cat_ev.event_type if cat_ev else None,
+            "catalyst_claim": (cat_ev.claim_type if cat_ev else None),
+            "catalyst_url": cat_ev.primary_url if cat_ev else None,
+            "reasons": (dc.reasons if dc else None) or [], "qualifying_pathways": dc.qualifying_pathways if dc else [],
+            "ai_status": dc.ai_status if dc else None,
             "outlook": r.outlook, "risk_rating": r.risk_rating, "horizon_class": r.horizon_class,
             "potential_return": base.potential_return if base else None,
             "target_price": base.target_price if base else None, "target_date": iso(f.target_date) if f else None,
@@ -117,6 +133,8 @@ def discovery(
             "catalyst": {"title": r.catalyst_title, "event_id": r.catalyst_event_id, "event_date": iso(r.catalyst_date)},
             "analysis_id": r.analysis_id, "analysis_at": iso(a.created_at) if a else None,
             "ai_kind": a.ai_kind if a else None, "selection_pathway": r.selection_pathway,
+            "valuation_status": a.valuation_status if a else None,
+            "valuation_method": ((a.valuation or {}).get("method_label") if a else None),
         })
     if sector:
         items = [i for i in items if (i["sector"] or "").lower() == sector.lower()]
@@ -139,23 +157,93 @@ def discovery(
                 "universe_size": run.universe_size, "candidates_evaluated": run.candidates_evaluated,
                 "config": run.config, "notes": run.notes, "stats": run.stats, "seed": run.seed},
         "ranking_explanation": (
-            "Candidates: 35 baseline leaders + 15 new catalysts + 10 underexplored stocks, chosen from baseline data "
-            "for the whole universe (ties rotate by a daily seed, never alphabetically). Score = 100 x (raw - worst) / "
+            ("Candidates from the whole US-listed market: 25 financial leaders + 15 valuation opportunities + 15 new "
+             "catalysts + 5 underexplored stocks, after market-wide eligibility screening. "
+             if run.universe_mode == "dynamic" else
+             "Candidates: 35 baseline leaders + 15 new catalysts + 10 underexplored stocks from the fixed universe. ") +
+            "Ties rotate by a daily seed, never alphabetically. Score = 100 x (raw - worst) / "
             "(best - worst) over known factors: financial strength 25%, catalyst 20%, valuation 25%, freshness 10%, "
             "minus forecast uncertainty 10% and downside risk 10%; unknown factors are excluded, not zeroed. "
-            "Rounded to 5 points; upside alone does not determine rank."),
+            "Ranked at full precision, rounded to 5 points for display; upside alone does not determine rank; "
+            "fewer than 20 are published when not enough stocks reach the minimum score."),
     }
 
 
+@router.get("/discovery/overview", tags=["discovery"], summary="Market discovery funnel counts (real database counts)")
+def discovery_overview(db: Session = Depends(get_db), mode: str = Depends(current_mode)) -> dict[str, Any]:
+    run = db.scalar(select(DiscoveryRun).where(DiscoveryRun.data_mode == mode, DiscoveryRun.status == "succeeded")
+                    .order_by(DiscoveryRun.started_at.desc()))
+    universe = dict(db.execute(select(Security.eligibility_status, func.count()).where(
+        Security.data_mode == mode).group_by(Security.eligibility_status)).all())
+    return {
+        "data_mode": mode, "universe_mode": get_settings().discovery_universe_mode,
+        "master_universe": {
+            "total": sum(universe.values()),
+            "active": db.scalar(select(func.count()).select_from(Security).where(Security.data_mode == mode, Security.active)),
+            "by_status": universe,
+            "last_refreshed_at": iso(db.scalar(select(func.max(Security.last_refreshed_at)).where(Security.data_mode == mode))),
+        },
+        "last_run": None if run is None else {
+            "id": run.id, "finished_at": iso(run.finished_at), "universe_mode": run.universe_mode,
+            "universe_version": run.universe_version, "stats": run.stats, "api_calls": run.api_calls,
+        },
+    }
+
+
+AUDIT_COLUMNS = ["run_id", "ticker", "status", "eligibility_status", "selected", "selection_order", "pathway",
+                 "qualifying_pathways", "reasons", "market_cap", "sector", "baseline_or_financial_score",
+                 "valuation_score", "data_completeness", "catalyst_status", "catalyst_score", "previously_analyzed",
+                 "score", "final_rank", "ai_status", "exclusion_reason", "exclusion_codes", "market_cap_basis",
+                 "fundamentals_source", "valuation_status", "valuation_method", "price_date", "tie_break_key",
+                 "model_versions"]
+
+
+@router.get("/discovery/audit.csv", tags=["discovery"], summary="Download the discovery audit (CSV)")
+def discovery_audit_csv(run_id: int | None = None, db: Session = Depends(get_db), mode: str = Depends(current_mode)):
+    import csv
+    import io as _io
+    import json as _json
+
+    from fastapi.responses import StreamingResponse
+
+    run = db.get(DiscoveryRun, run_id) if run_id else db.scalar(
+        select(DiscoveryRun).where(DiscoveryRun.data_mode == mode, DiscoveryRun.status == "succeeded")
+        .order_by(DiscoveryRun.started_at.desc()))
+    if run is None or run.data_mode != mode:
+        raise api_error(404, "not_found", "No discovery run found")
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(AUDIT_COLUMNS)
+    for r in db.scalars(select(DiscoveryCandidate).where(DiscoveryCandidate.run_id == run.id)
+                        .order_by(DiscoveryCandidate.final_rank.nulls_last(), DiscoveryCandidate.selection_order.nulls_last(),
+                                  DiscoveryCandidate.ticker)):
+        sm = r.screen_metrics or {}
+        w.writerow([run.id, r.ticker, r.status, r.eligibility_status, r.selected, r.selection_order, r.pathway,
+                    "|".join(r.qualifying_pathways or []), " | ".join(x.get("text", "") for x in (r.reasons or [])),
+                    r.market_cap, sm.get("sector"), r.baseline_score, r.valuation_score, r.data_completeness,
+                    r.catalyst_status, r.catalyst_score, r.previously_analyzed, r.score, r.final_rank, r.ai_status,
+                    r.exclusion_reason, "|".join(sm.get("exclusion_codes") or []),
+                    (sm.get("market_cap_info") or {}).get("basis"), sm.get("fundamentals_source"),
+                    (r.factors or {}).get("valuation_status"), (r.factors or {}).get("valuation_method"),
+                    (r.data_timestamps or {}).get("price_date"), r.tie_break_key, _json.dumps(r.model_versions or {})])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="eventalpha-discovery-{run.id}.csv"'})
+
+
 @router.get("/discovery/candidates", tags=["discovery"], summary="Selection audit for a discovery run")
-def discovery_candidates(run_id: int | None = None, db: Session = Depends(get_db),
+def discovery_candidates(run_id: int | None = None, scope: Literal["selected", "all"] = "selected",
+                         limit: int = Query(500, le=10000), db: Session = Depends(get_db),
                          mode: str = Depends(current_mode)) -> dict[str, Any]:
     q = select(DiscoveryRun).where(DiscoveryRun.data_mode == mode)
     run = db.get(DiscoveryRun, run_id) if run_id else db.scalar(
         q.where(DiscoveryRun.status == "succeeded").order_by(DiscoveryRun.started_at.desc()))
     if run is None or run.data_mode != mode:
         raise api_error(404, "not_found", "No discovery run found")
-    rows = db.scalars(select(DiscoveryCandidate).where(DiscoveryCandidate.run_id == run.id)).all()
+    q = select(DiscoveryCandidate).where(DiscoveryCandidate.run_id == run.id)
+    if scope == "selected":
+        q = q.where(DiscoveryCandidate.selected)
+    rows = db.scalars(q).all()
     status_order = {"ranked": 0, "screened": 1, "excluded": 2, "selected": 3, "not_selected": 4, "ineligible": 5}
     rows = sorted(rows, key=lambda r: (status_order.get(r.status, 9), r.final_rank or 999, r.selection_order or 999,
                                        -(r.baseline_score or 0)))
@@ -168,7 +256,13 @@ def discovery_candidates(run_id: int | None = None, db: Session = Depends(get_db
             "previously_analyzed": r.previously_analyzed, "last_analyzed_at": iso(r.last_analyzed_at),
             "data_timestamps": r.data_timestamps, "score": r.score, "factors": r.factors,
             "exclusion_reason": r.exclusion_reason, "final_rank": r.final_rank, "tie_break_key": r.tie_break_key,
-        } for r in rows],
+            "eligibility_status": r.eligibility_status, "market_cap": r.market_cap, "valuation_score": r.valuation_score,
+            "data_completeness": r.data_completeness, "reasons": r.reasons, "ai_status": r.ai_status,
+            "sector": (r.screen_metrics or {}).get("sector"),
+            "exclusion_codes": (r.screen_metrics or {}).get("exclusion_codes") or [],
+            "valuation_status": (r.factors or {}).get("valuation_status"),
+        } for r in rows[:limit]],
+        "total_rows": len(rows),
     }
 
 
@@ -334,7 +428,8 @@ def get_settings_route(db: Session = Depends(get_db), mode: str = Depends(curren
                       "jobs": [
                           {"id": "ingest_news", "schedule": f"every {s.news_ingest_interval_minutes} min"},
                           {"id": "refresh_prices", "schedule": "Mon–Fri 16:45 ET on NYSE sessions"},
-                          {"id": "refresh_baseline", "schedule": "Mon–Fri 17:05 ET on NYSE sessions"},
+                          {"id": "refresh_baseline", "schedule": "Mon–Fri 17:05 ET on NYSE sessions (market data + screening)"},
+                          {"id": "refresh_universe", "schedule": "Sunday 06:00 ET (master ticker universe)"},
                           {"id": "sec_monitor", "schedule": "Mon–Fri every 2h 07:10–19:10 ET"},
                           {"id": "catalyst_analysis", "schedule": "Mon–Fri 17:30 ET on NYSE sessions"},
                           {"id": "discovery", "schedule": "Mon–Fri 18:00 ET on NYSE sessions"},

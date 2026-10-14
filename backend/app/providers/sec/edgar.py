@@ -90,6 +90,64 @@ class EdgarClient:
         return self.client.get_json(COMPANYFACTS_URL.format(cik=pad_cik(cik)), cache_ttl=timedelta(hours=12))
 
 
+FRAMES_URL = "https://data.sec.gov/api/xbrl/frames/{tax}/{concept}/{unit}/{period}.json"
+DAILY_INDEX_URL = "https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{q}/form.{d}.idx"
+
+
+class IndexedFiling(BaseModel):
+    form: str
+    company: str
+    cik: str
+    filed_date: date
+    path: str
+
+    @property
+    def url(self) -> str:
+        return f"https://www.sec.gov/Archives/{self.path}"
+
+
+def frame(client: EdgarClient, tax: str, concept: str, unit: str, period: str) -> list[dict[str, Any]]:
+    """Market-wide XBRL frame: one fact per filer for a calendar period (e.g. CY2025, CY2026Q2I)."""
+    try:
+        data = client.client.get_json(FRAMES_URL.format(tax=tax, concept=concept, unit=unit, period=period))
+    except DataUnavailable:
+        return []
+    return data.get("data", []) if isinstance(data, dict) else []
+
+
+def daily_index(client: EdgarClient, day: date) -> list[IndexedFiling] | None:
+    """All filings submitted on one day (None when SEC publishes no index, e.g. holidays/weekends)."""
+    from app.services.http import ProviderAccessDenied
+
+    url = DAILY_INDEX_URL.format(y=day.year, q=(day.month - 1) // 3 + 1, d=day.strftime("%Y%m%d"))
+    try:
+        txt = client.client.get_text(url, cache_ttl=timedelta(days=30))
+    except (DataUnavailable, ProviderAccessDenied):
+        return None  # SEC's archive answers 403 for days without an index
+    return parse_daily_index(txt)
+
+
+def parse_daily_index(txt: str) -> list[IndexedFiling]:
+    lines = txt.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("---")) + 1
+    except StopIteration:
+        return []
+    out = []
+    for ln in lines[start:]:
+        parts = ln.rsplit(None, 3)  # company names contain spaces; the last 3 columns don't
+        if len(parts) != 4:
+            continue
+        head, cik, filed, path = parts
+        form, company = head[:12].strip(), head[12:].strip()
+        try:
+            fd = date(int(filed[:4]), int(filed[4:6]), int(filed[6:8]))
+        except ValueError:
+            continue
+        out.append(IndexedFiling(form=form, company=company, cik=pad_cik(cik), filed_date=fd, path=path))
+    return out
+
+
 def normalize_ticker(ticker: str) -> str:
     # SEC uses '-' for share classes (BRK-B); vendors often use '.' (BRK.B)
     return ticker.strip().upper().replace(".", "-")

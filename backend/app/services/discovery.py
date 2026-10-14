@@ -45,6 +45,7 @@ from app.services.discovery_scoring import (
     factor_values,
     financial_strength,  # noqa: F401  (re-exported for callers/tests)
 )
+from app.services.forecasting.valuation_guardrails import ranking_exclusion
 from app.services.http import ProviderError
 from app.services.market_calendar import NY
 from app.services.selection import (
@@ -61,13 +62,37 @@ RANKING_WEIGHTS = FACTOR_WEIGHTS  # backwards-compatible name used by the settin
 NEW_CATALYST_FALLBACK_WINDOW = timedelta(hours=72)
 
 
-def catalyst_score(events: list[tuple[Event, EventCompanyRelationship]]) -> tuple[float, Event | None]:
+def event_time_factor(ev: Event, now: datetime | None = None) -> float:
+    """Recency for past events (decays over ~10 days, floor 0.5); timing for upcoming ones."""
+    now = now or datetime.now(UTC)
+    if ev.event_date is not None:
+        days = (ev.event_date - now.date()).days
+        return 1.0 if days <= 14 else 0.9 if days <= 30 else 0.75
+    ts = ev.last_published_at or ev.first_published_at
+    if ts is None:
+        return 0.5
+    import math
+
+    return max(0.5, math.exp(-max(0.0, (now - ts).total_seconds() / 86400) / 10))
+
+
+def significance_factor(ev: Event, market_cap: float | None) -> float:
+    """A stated dollar amount relative to the company's size (unknown -> neutral)."""
+    if not ev.amount_usd or not market_cap:
+        return 1.0
+    r = ev.amount_usd / market_cap
+    return 1.2 if r >= 0.05 else 1.0 if r >= 0.01 else 0.85
+
+
+def catalyst_score(events: list[tuple[Event, EventCompanyRelationship]], market_cap: float | None = None,
+                   now: datetime | None = None) -> tuple[float, Event | None]:
+    """Strongest catalyst for one company: materiality (category x source credibility x
+    confirmation) x company relevance (link confidence) x recency/timing x financial significance,
+    halved for negative-impact events. Never a count of articles."""
     best, best_ev = 0.0, None
     for ev, link in events:
-        m = (ev.materiality or 0.3) * link.confidence
+        m = (ev.materiality or 0.3) * link.confidence * event_time_factor(ev, now) * significance_factor(ev, market_cap)
         if ev.impact == "negative":
-            m *= 0.5
-        if ev.status == "unconfirmed":
             m *= 0.5
         if m > best:
             best, best_ev = m, ev
@@ -127,7 +152,12 @@ def build_universe_items(session: Session, mode: DataMode, companies: dict[str, 
 
 
 def run_discovery(session: Session, mode: DataMode, progress=lambda m: None) -> DiscoveryRun:
+    """Feature flag DISCOVERY_UNIVERSE_MODE: "dynamic" (market-wide, default) or "fixed" (universe.txt)."""
     s = get_settings()
+    if s.discovery_universe_mode == "dynamic":
+        from app.services.dynamic_discovery import run_dynamic_discovery
+
+        return run_dynamic_discovery(session, mode, progress)
     quotas = {"baseline_leader": s.discovery_quota_baseline, "new_catalyst": s.discovery_quota_catalyst,
               "underexplored": s.discovery_quota_underexplored}
     now = datetime.now(UTC)
@@ -135,7 +165,7 @@ def run_discovery(session: Session, mode: DataMode, progress=lambda m: None) -> 
     prev = session.scalar(select(DiscoveryRun).where(DiscoveryRun.data_mode == mode, DiscoveryRun.status == "succeeded")
                           .order_by(DiscoveryRun.started_at.desc()))
     new_since = prev.started_at if prev else now - NEW_CATALYST_FALLBACK_WINDOW
-    run = DiscoveryRun(data_mode=mode, seed=seed, config={
+    run = DiscoveryRun(data_mode=mode, seed=seed, universe_mode="fixed", config={
         "formula": FORMULA, "quotas": quotas, "total_candidates": s.discovery_max_candidates,
         "top_n": s.discovery_top_n, "ai_top_n": s.discovery_ai_top_n,
         "min_avg_dollar_volume": s.min_avg_dollar_volume, "new_catalyst_since": new_since.isoformat(),
@@ -191,6 +221,8 @@ def run_discovery(session: Session, mode: DataMode, progress=lambda m: None) -> 
         reason = None
         if adv is not None and adv < s.min_avg_dollar_volume:
             reason = f"illiquid (20d avg dollar volume {adv:,.0f})"
+        elif (excl := ranking_exclusion(a.valuation_status, a.valuation)) is not None:
+            reason = excl
         elif snap.get("base_target_12m") is None:
             reason = "no valid valuation (missing/implausible data or no applicable method)"
         if reason:

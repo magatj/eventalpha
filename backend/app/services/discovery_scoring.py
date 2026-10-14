@@ -53,7 +53,8 @@ FORMULA = {
                               "clamp((revenue_growth+0.05)/0.25), net-cash term",
         "catalyst_materiality": "max over recent/upcoming events of materiality x link confidence "
                                 "(x0.5 if negative impact, x0.5 if unconfirmed); unknown if news not checked",
-        "valuation": "clamp((base_return_12m + 0.10) / 0.50)",
+        "valuation": "clamp((base_return_12m + 0.10) / 0.50); shrunk halfway toward 0.5 when the valuation "
+                     "status is limited_data; unknown (excluded) unless the valuation is valid or limited",
         "data_freshness": "(1.0 if price current, 0.7 if <=2 sessions old, else 0.3) x "
                           "(1.0 if latest filing <=120 days old, else 0.7)",
         "forecast_uncertainty": "clamp((bull_return_12m - bear_return_12m) / 1.5)",
@@ -99,10 +100,16 @@ def factor_values(snapshot: dict[str, Any], catalyst_status: CatalystStatus, cat
         catalyst = 0.0
     else:
         catalyst = clamp01(catalyst_score or 0.0)
+    vstatus = snapshot.get("valuation_status")
+    valuation = clamp01((base + 0.10) / 0.50) if base is not None else None
+    if vstatus in ("requires_review", "unsupported_valuation", "invalid_inputs"):
+        valuation = None  # an unsupported result can never look attractive
+    elif valuation is not None and vstatus == "limited_data":
+        valuation = 0.5 + (valuation - 0.5) * 0.5  # fallback evidence: less conviction either way
     return {
         "financial_strength": financial_strength(snapshot),
         "catalyst_materiality": catalyst,
-        "valuation": clamp01((base + 0.10) / 0.50) if base is not None else None,
+        "valuation": valuation,
         "data_freshness": data_freshness(snapshot.get("stale_sessions", 0), filing_age_days),
         "forecast_uncertainty": clamp01((bull - bear) / 1.5) if bull is not None and bear is not None else None,
         "downside_risk": clamp01(-bear / 0.6) if bear is not None else None,

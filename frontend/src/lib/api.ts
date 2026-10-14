@@ -90,6 +90,125 @@ export interface DiscoveryItem {
   analysis_at: string | null;
   ai_kind: string | null;
   selection_pathway: string | null;
+  score_display?: number;
+  market_cap?: number | null;
+  size?: "mega" | "large" | "mid" | "small" | "micro" | null;
+  financial_strength?: number | null;
+  valuation?: number | null;
+  data_completeness?: number | null;
+  catalyst_category?: string | null;
+  catalyst_claim?: string | null;
+  catalyst_url?: string | null;
+  reasons?: { code: string; text: string; source_url?: string }[];
+  qualifying_pathways?: string[];
+  ai_status?: string | null;
+  valuation_status?: ValuationStatus | null;
+  valuation_method?: string | null;
+}
+
+export type ValuationStatus = "valid" | "limited_data" | "requires_review" | "unsupported_valuation" | "invalid_inputs";
+
+export interface MultipleBand {
+  kind: string;
+  p10: number;
+  p25: number;
+  p50: number;
+  p75: number;
+  p90: number;
+  n: number;
+  rejected: number;
+  source: string;
+  detail: string;
+}
+
+export interface MultipleSelection {
+  kind: string;
+  current: number | null;
+  bear: number;
+  base_anchor: number;
+  bull: number;
+  low: number;
+  high: number;
+  basis: string;
+  limited: boolean;
+  evidence: { company_history: MultipleBand | null; peers: MultipleBand | null; fundamental_anchor: number | null; sector_reference: number[] | null };
+  notes: string[];
+}
+
+export interface ValuationScenario {
+  revenue: number | null;
+  revenue_growth: number | null;
+  net_margin: number | null;
+  net_income: number | null;
+  eps: number | null;
+  free_cash_flow: number | null;
+  capex: number | null;
+  stock_based_comp: number | null;
+  shares: number | null;
+  pe_multiple: number | null;
+  book_value_model: { multiple: number; return_on_equity: number; [k: string]: unknown } | null;
+  ffo_model: { multiple: number; ffo_per_share: number } | null;
+  price_to_sales_multiple: number | null;
+  dcf: { discount_rate: number; terminal_growth: number; fcf_margin: number; fcf_basis: string } | null;
+  method_weights: Record<string, number> | null;
+  method_targets: Record<string, number> | null;
+  target_price: number | null;
+  potential_return: number | null;
+  withheld_target: number | null;
+  target_date: string;
+}
+
+export interface ValuationAudit {
+  status: ValuationStatus;
+  status_label: string;
+  model_version: string;
+  method: string;
+  method_label: string;
+  business_model: string;
+  rationale: string;
+  required_inputs: Record<string, boolean>;
+  missing_inputs: string[];
+  plan_notes: string[];
+  weights: Record<string, number>;
+  historical_multiples: Record<string, MultipleBand>;
+  peers: { level: string; tickers: string[]; bands: Record<string, MultipleBand>; profitable_margin: number | null } | null;
+  multiples: {
+    pe: MultipleSelection | null;
+    ps: MultipleSelection | null;
+    book: { kind: string; measure: string; per_share_today: number; normalized_return: number; return_basis: string; retention: number; retention_basis: string; cost_of_equity: number; justified_multiple: number | null; multiples: MultipleSelection; notes: string[] } | null;
+    ffo: { ffo_per_share_today: number; ffo_basis: string; multiples: MultipleSelection; notes: string[] } | null;
+  };
+  earnings_state: string | null;
+  regime: string | null;
+  scenarios_12m: Record<"bear" | "base" | "bull", ValuationScenario>;
+  guardrails: {
+    status: ValuationStatus;
+    label: string;
+    flags: { code: string; severity: "info" | "warning" | "review" | "invalid"; message: string }[];
+    upside_check: { threshold?: number; base_return_12m?: number | null; supported?: boolean; checks?: Record<string, boolean>; expansion?: number | null };
+  };
+  market_cap: { value: number | null; basis: string; shares: number | null };
+  financial_status: string;
+  validation: string[];
+  split_adjustments: string[];
+  financial_coverage: Record<string, boolean>;
+  provenance: Record<string, { concept?: string; period_end?: string; fiscal_year?: number; fiscal_period?: string; filed?: string; accession?: string; basis?: string; ignored?: string } | null>;
+  data_timestamps: { price_date: string; latest_filing: string | null; ttm_period_end: string | null };
+  notes: string[];
+}
+
+export interface DiscoveryOverview {
+  data_mode: DataMode;
+  universe_mode: "dynamic" | "fixed";
+  master_universe: { total: number; active: number; by_status: Record<string, number>; last_refreshed_at: string | null };
+  last_run: null | {
+    id: number;
+    finished_at: string;
+    universe_mode: string | null;
+    universe_version: string | null;
+    api_calls: { requests: Record<string, number>; cache_hits: Record<string, number> } | null;
+    stats: Record<string, unknown> | null;
+  };
 }
 
 export interface DiscoveryStats {
@@ -123,6 +242,8 @@ export interface CandidateRow {
   data_timestamps: Record<string, string | null>;
   score: number | null;
   exclusion_reason: string | null;
+  exclusion_codes?: string[];
+  valuation_status?: ValuationStatus | null;
   final_rank: number | null;
 }
 
@@ -188,6 +309,8 @@ export interface AnalysisSummary {
   bear_target_12m: number | null;
   bull_target_12m: number | null;
   base_return_12m: number | null;
+  valuation_status?: ValuationStatus | null;
+  valuation_method?: string | null;
 }
 
 export interface Claim {
@@ -226,6 +349,7 @@ export interface AnalysisDetail extends AnalysisSummary {
   previous: AnalysisSummary | null;
   diff: Diff | null;
   disclaimer: string;
+  valuation?: ValuationAudit | null;
 }
 
 export interface ScenarioResult {
@@ -369,10 +493,15 @@ export const useDiscovery = (params = "") =>
     queryFn: () => api<Discovery>(`/api/discovery${params}`),
     refetchInterval: (q) => (q.state.data?.running_job ? 4000 : false),
   });
-export const useDiscoveryCandidates = (enabled: boolean) =>
+export const useDiscoveryOverview = () =>
+  useQuery({ queryKey: ["discoveryOverview"], queryFn: () => api<DiscoveryOverview>("/api/discovery/overview") });
+export const useDiscoveryCandidates = (enabled: boolean, scope: "selected" | "all" = "selected") =>
   useQuery({
-    queryKey: ["discoveryCandidates"],
-    queryFn: () => api<{ run_id: number; seed: string; stats: DiscoveryStats; candidates: CandidateRow[] }>("/api/discovery/candidates"),
+    queryKey: ["discoveryCandidates", scope],
+    queryFn: () =>
+      api<{ run_id: number; seed: string; stats: DiscoveryStats; candidates: CandidateRow[]; total_rows: number }>(
+        `/api/discovery/candidates?scope=${scope}&limit=2000`,
+      ),
     enabled,
     retry: false,
   });

@@ -32,8 +32,12 @@ function MarketOverview() {
           <Card key={q.symbol} className="p-4">
             <div className="flex items-start justify-between gap-2">
               <div>
-                <div className="text-xs text-muted">{q.proxy_for}</div>
-                <div className="text-[11px] text-subtle">{q.kind === "etf_proxy" ? `${q.symbol} ETF proxy` : q.name}</div>
+                <div className="text-xs text-muted">{q.kind === "etf_proxy" ? q.proxy_for : q.name}</div>
+                <div className={q.kind === "etf_proxy" ? "text-[11px] text-warn" : "text-[11px] text-subtle"} title={q.unavailable_reason ?? undefined}>
+                  {q.kind === "etf_proxy"
+                    ? `${q.symbol} ETF price — index level unavailable`
+                    : `Index level · ${q.source === "fred" ? "FRED (St. Louis Fed)" : q.source === "massive" ? "Massive" : q.source}`}
+                </div>
               </div>
               <ProvenanceBadge kind="observed" />
             </div>

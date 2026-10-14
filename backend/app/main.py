@@ -13,7 +13,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import routes, stocks
+from app.api import chat, routes, stocks
 from app.config import get_settings
 from app.services.analysis import AnalysisError
 from app.services.http import ProviderError
@@ -83,3 +83,4 @@ async def provider_exc(_: Request, exc: ProviderError):
 
 app.include_router(routes.router)
 app.include_router(stocks.router)
+app.include_router(chat.router)

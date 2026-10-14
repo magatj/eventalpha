@@ -154,3 +154,33 @@ def test_slot_keys():
 def test_trading_day_jobs_skip_holidays_without_touching_db():
     christmas = lambda: datetime(2025, 12, 25, 18, 0, tzinfo=NY)  # noqa: E731
     assert enqueue_slot("discovery", "day", trading_days_only=True, now_fn=christmas) is None
+
+
+def test_scheduled_jobs_run_in_new_york_time_not_container_utc():
+    """Regression: APScheduler cron triggers default to the container's UTC zone, which ran the
+    16:45 'after close' price refresh at 12:45 ET."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app.scheduler.main import build_scheduler
+
+    ny = ZoneInfo("America/New_York")
+    jobs = {j.id: j for j in build_scheduler().get_jobs()}
+    for jid in ("refresh_prices", "refresh_baseline", "discovery", "refresh_universe"):
+        assert str(jobs[jid].trigger.timezone) == "America/New_York"
+    nxt = jobs["refresh_prices"].trigger.get_next_fire_time(None, datetime(2026, 10, 13, 12, 0, tzinfo=ny))
+    assert (nxt.astimezone(ny).hour, nxt.astimezone(ny).minute) == (16, 45)
+
+
+def test_overnight_catch_up_jobs_do_not_collide_with_after_close_slots():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app.scheduler.main import build_scheduler, slot_key
+
+    ny = ZoneInfo("America/New_York")
+    ids = {j.id for j in build_scheduler().get_jobs()}
+    assert {"refresh_prices_catchup_0", "refresh_baseline_catchup_6"} <= ids
+    after_close = slot_key("refresh_prices", "live", datetime(2026, 10, 14, 16, 45, tzinfo=ny), "day")
+    catch_up = slot_key("refresh_prices", "live", datetime(2026, 10, 14, 0, 30, tzinfo=ny), "hour")
+    assert after_close != catch_up

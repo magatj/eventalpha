@@ -20,7 +20,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.cron import CronTrigger as _CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import text
 
@@ -55,6 +55,13 @@ def enqueue_slot(job_type: str, granularity: str, trading_days_only: bool = Fals
         return key
 
 
+def CronTrigger(**kw) -> _CronTrigger:  # noqa: N802
+    """Cron trigger in New York time. APScheduler 3 does NOT inherit the scheduler's timezone for a trigger
+    object built in advance — it uses the container's local zone (UTC), which ran the "after close"
+    jobs at 12:45 ET."""
+    return _CronTrigger(timezone=NY, **kw)
+
+
 def build_scheduler() -> BackgroundScheduler:
     s = get_settings()
     sched = BackgroundScheduler(timezone=NY, job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 900})
@@ -62,6 +69,13 @@ def build_scheduler() -> BackgroundScheduler:
                   id="ingest_news", next_run_time=datetime.now(NY))
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour=16, minute=45),
                   args=["refresh_prices", "day", True], id="refresh_prices")
+    # Overnight catch-up: free market-data plans publish a session's end-of-day data some hours after the
+    # close, so the after-close refresh can only see the previous session. These pick up the latest close.
+    for hour in (0, 6):
+        sched.add_job(enqueue_slot, CronTrigger(day_of_week="tue-sat", hour=hour, minute=30),
+                      args=["refresh_prices", "hour"], id=f"refresh_prices_catchup_{hour}")
+        sched.add_job(enqueue_slot, CronTrigger(day_of_week="tue-sat", hour=hour, minute=40),
+                      args=["refresh_baseline", "hour"], id=f"refresh_baseline_catchup_{hour}")
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour="7-20/2", minute=10),
                   args=["sec_monitor", "2hour"], id="sec_monitor")
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="mon-fri", hour=17, minute=5),
@@ -73,6 +87,8 @@ def build_scheduler() -> BackgroundScheduler:
     sched.add_job(enqueue_slot, CronTrigger(day_of_week="sat", hour=9, minute=0),
                   args=["forecast_review", "week"], id="forecast_review")
     sched.add_job(enqueue_slot, CronTrigger(hour=3, minute=15), args=["cache_cleanup", "day"], id="cache_cleanup")
+    sched.add_job(enqueue_slot, CronTrigger(day_of_week="sun", hour=6, minute=0),
+                  args=["refresh_universe", "week"], id="refresh_universe")
     return sched
 
 

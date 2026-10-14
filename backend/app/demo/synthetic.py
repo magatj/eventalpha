@@ -6,6 +6,7 @@ and every API response in demo mode carries data_mode="demo" so the UI labels it
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 from datetime import UTC, date, datetime, time, timedelta
@@ -17,6 +18,7 @@ from app.providers.market.base import (
     CorporateActionData,
     IndexQuote,
     LatestPrice,
+    ListedSecurity,
     MarketDataProvider,
     PriceBar,
     ProviderArticle,
@@ -77,7 +79,53 @@ def demo_params(ticker: str) -> dict:
         "shares": float(r.uniform(3e8, 5e9)),
         "share_rate": float(r.uniform(-0.03, 0.02)),
         "debt_ratio": float(r.uniform(0.0, 1.5)),
+        # generated listings span mega-caps to illiquid micro-caps
+        "liquidity": 1.0 if ticker in DEMO_UNIVERSE else float(r.choice([0.001, 0.02, 0.3, 1.0, 2.0])),
     }
+
+
+def _demo_extra_tickers(n: int = 140) -> list[str]:
+    out: list[str] = []
+    k = 0
+    while len(out) < n:
+        h = hashlib.sha256(f"extra|{k}".encode()).hexdigest()
+        t = "".join(chr(65 + int(h[i:i + 2], 16) % 26) for i in range(0, 8, 2))
+        if t not in DEMO_UNIVERSE and t not in out:
+            out.append(t)
+        k += 1
+    return out
+
+
+DEMO_EXTRA = _demo_extra_tickers()
+_EXTRA_TYPES = {0: "ETF", 1: "WARRANT", 2: "PFD", 3: "ADRC", 4: "RIGHT"}
+
+
+def demo_listing() -> list[ListedSecurity]:
+    """Synthetic "whole market": the named demo stocks plus generated listings of mixed types."""
+    out = [ListedSecurity(ticker=t, name=f"{t} Synthetic Corp (DEMO)", exchange="XNYS" if i % 2 else "XNAS",
+                          security_type="CS", currency="USD", locale="us", cik=f"9{i:09d}",
+                          composite_figi=f"DEMOFIGI{t:>8}")
+           for i, t in enumerate(DEMO_UNIVERSE)]
+    for i, t in enumerate(DEMO_EXTRA):
+        stype = _EXTRA_TYPES.get(i % 24, "CS")
+        out.append(ListedSecurity(
+            ticker=t, name=f"Synthetic Holdings {i:03d} (DEMO)", exchange=("XNAS", "XNYS", "XASE")[i % 3],
+            security_type=stype, currency="USD", locale="us", cik=f"8{i:09d}" if stype == "CS" else None,
+            composite_figi=f"DEMOFIGX{i:07d}", active=i % 37 != 5))
+    return out
+
+
+_DEMO_INDUSTRIES = [("Technology", "7372", "Software"), ("Health Care", "2834", "Pharmaceuticals"),
+                    ("Industrials", "3560", "General industrial"), ("Consumer Discretionary", "5940", "Specialty retail"),
+                    ("Financials", "6022", "Banking"), ("Energy", "1311", "Oil & gas production"),
+                    ("Consumer Staples", "2080", "Beverages"), ("Utilities", "4911", "Electric utilities"),
+                    ("Materials", "2800", "Chemicals"), ("Communication Services", "4813", "Telecom")]
+
+
+def demo_classification(ticker: str) -> tuple[str, str, str]:
+    if ticker in DEMO_UNIVERSE:
+        return DEMO_UNIVERSE[ticker]
+    return _DEMO_INDUSTRIES[_seed(ticker, "industry") % len(_DEMO_INDUSTRIES)]
 
 
 def is_valid_demo_ticker(ticker: str) -> bool:
@@ -93,6 +141,9 @@ class DemoMarketProvider(MarketDataProvider):
         self.as_of = as_of or last_completed_session()
 
     def _series(self, ticker: str) -> list[PriceBar]:
+        return _cached_series(ticker, self.as_of)
+
+    def _build_series(self, ticker: str) -> list[PriceBar]:
         p = demo_params(ticker)
         days = sessions_between(self.as_of - timedelta(days=3 * 365), self.as_of)
         r = _rng(ticker, "prices")
@@ -114,7 +165,8 @@ class DemoMarketProvider(MarketDataProvider):
             spread = abs(z) * p["vol"] * math.sqrt(dt) * c
             bars.append(PriceBar(date=d, open=float(c * (1 + 0.002 * z)), high=float(c + spread),
                                  low=float(max(0.01, c - spread)), close=float(c),
-                                 volume=float(abs(r.normal(8e6, 2e6)) + 5e5), vwap=float(c)))
+                                 volume=float((abs(r.normal(8e6, 2e6)) + 5e5) * p.get("liquidity", 1.0)),
+                                 vwap=float(c)))
         return bars
 
     def get_latest_price(self, ticker: str) -> LatestPrice:
@@ -129,7 +181,7 @@ class DemoMarketProvider(MarketDataProvider):
     def get_company_profile(self, ticker: str) -> CompanyProfile:
         if not is_valid_demo_ticker(ticker):
             raise DataUnavailable(DEMO_SOURCE, f"{ticker} is not a valid ticker format")
-        sector, sic, industry = DEMO_UNIVERSE.get(ticker, ("Industrials", "3560", "General industrial"))
+        sector, sic, industry = demo_classification(ticker)
         p = demo_params(ticker)
         last = self._series(ticker)[-1].close
         return CompanyProfile(
@@ -154,13 +206,32 @@ class DemoMarketProvider(MarketDataProvider):
     def get_company_news(self, ticker: str, limit: int = 20) -> list[ProviderArticle]:
         return demo_articles(self.as_of, [ticker])[:limit]
 
+    def list_securities(self, security_type: str, on_page=lambda n: None) -> list[ListedSecurity]:
+        rows = [s for s in demo_listing() if s.security_type == security_type and s.active]
+        on_page(1)
+        return rows
+
+    def get_grouped_daily(self, day: date, adjusted: bool = False) -> dict[str, PriceBar]:
+        out = {}
+        for s in demo_listing():
+            if s.security_type in ("CS", "ADRC") and s.active:
+                bar = next((b for b in _cached_series(s.ticker, self.as_of) if b.date == day), None)
+                if bar:
+                    out[s.ticker] = bar
+        return out
+
     def get_market_news(self, limit: int = 1000) -> list[ProviderArticle]:
         # Deterministic subset: about half the demo universe has market-wide coverage.
-        covered = [t for t in DEMO_UNIVERSE if _seed(t, "mkt-news") % 2 == 0]
+        covered = [t for t in list(DEMO_UNIVERSE) + DEMO_EXTRA[:40] if _seed(t, "mkt-news") % 2 == 0]
         return demo_articles(self.as_of, covered)[:limit]
 
     def benchmark_series(self) -> list[PriceBar]:
         return self._series("SPY")
+
+
+@functools.lru_cache(maxsize=512)
+def _cached_series(ticker: str, as_of: date) -> list[PriceBar]:
+    return DemoMarketProvider(as_of)._build_series(ticker)
 
 
 def demo_financial_facts(ticker: str, as_of: date) -> list[FinancialFact]:

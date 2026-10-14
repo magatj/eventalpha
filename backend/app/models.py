@@ -187,6 +187,10 @@ class Event(Base):
     impact: Mapped[str] = mapped_column(String(16), default="uncertain")  # positive | negative | uncertain
     impact_explanation: Mapped[str | None] = mapped_column(Text)
     materiality: Mapped[float | None] = mapped_column(Float)
+    materiality_detail: Mapped[Any | None] = mapped_column(JSONB)
+    # confirmed | management_statement | analyst_interpretation | speculation | scheduled
+    claim_type: Mapped[str | None] = mapped_column(String(24))
+    amount_usd: Mapped[float | None] = mapped_column(Float)  # dollar amount mentioned, if any
     source_name: Mapped[str | None] = mapped_column(String(255))
     primary_url: Mapped[str | None] = mapped_column(Text)
     first_published_at: Mapped[datetime | None] = mapped_column(TS)
@@ -264,6 +268,10 @@ class Analysis(Base):
     financial_data_version: Mapped[str | None] = mapped_column(String(64))
     forecast_model_version: Mapped[str] = mapped_column(String(32))
     warnings: Mapped[Any | None] = mapped_column(JSONB)
+    # valuation audit: method, evidence, guardrails (valid | limited_data | requires_review |
+    # unsupported_valuation | invalid_inputs). Null for analyses made before quant-2.0.0.
+    valuation_status: Mapped[str | None] = mapped_column(String(24), index=True)
+    valuation: Mapped[Any | None] = mapped_column(JSONB)
 
     company: Mapped[Company] = relationship()
     sources: Mapped[list[AnalysisSource]] = relationship(cascade="all, delete-orphan")
@@ -416,6 +424,9 @@ class DiscoveryRun(Base):
     notes: Mapped[Any | None] = mapped_column(JSONB)
     seed: Mapped[str | None] = mapped_column(String(32))  # tie-break rotation seed (reproducible)
     stats: Mapped[Any | None] = mapped_column(JSONB)  # coverage / diversity summary
+    universe_mode: Mapped[str | None] = mapped_column(String(16))  # fixed | dynamic
+    universe_version: Mapped[str | None] = mapped_column(String(64))
+    api_calls: Mapped[Any | None] = mapped_column(JSONB)
 
     recommendations: Mapped[list[Recommendation]] = relationship(order_by="Recommendation.rank")
 
@@ -481,7 +492,7 @@ class DiscoveryCandidate(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("discovery_runs.id", ondelete="CASCADE"), index=True)
-    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"))
+    company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"))
     ticker: Mapped[str] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(16))  # ineligible | not_selected | excluded | screened | ranked
     selected: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -500,3 +511,188 @@ class DiscoveryCandidate(Base):
     exclusion_reason: Mapped[str | None] = mapped_column(Text)
     analysis_id: Mapped[int | None] = mapped_column(ForeignKey("analyses.id", ondelete="SET NULL"))
     final_rank: Mapped[int | None] = mapped_column(Integer)
+    security_id: Mapped[int | None] = mapped_column(ForeignKey("securities.id", ondelete="SET NULL"), index=True)
+    eligibility_status: Mapped[str | None] = mapped_column(String(24))
+    market_cap: Mapped[float | None] = mapped_column(Float)
+    screen_metrics: Mapped[Any | None] = mapped_column(JSONB)  # point-in-time screening inputs
+    valuation_score: Mapped[float | None] = mapped_column(Float)
+    data_completeness: Mapped[float | None] = mapped_column(Float)
+    reasons: Mapped[Any | None] = mapped_column(JSONB)  # why EventAlpha discovered it
+    ai_status: Mapped[str | None] = mapped_column(String(24))
+    model_versions: Mapped[Any | None] = mapped_column(JSONB)
+
+
+class Security(Base):
+    """Master universe: every US-listed security discovered from the market-data provider.
+
+    Identity is the composite FIGI when available (stable across ticker changes), otherwise
+    CIK+ticker. Rows are never deleted: delisted/ineligible securities keep their history."""
+
+    __tablename__ = "securities"
+    __table_args__ = (
+        UniqueConstraint("data_mode", "security_key", name="uq_security_key"),
+        Index("ix_security_mode_ticker", "data_mode", "ticker"),
+        Index("ix_security_mode_cik", "data_mode", "cik"),
+        Index("ix_security_mode_status", "data_mode", "eligibility_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    data_mode: Mapped[str] = mapped_column(String(8))
+    security_key: Mapped[str] = mapped_column(String(64))  # FIGI:<composite> | CIK:<cik>:<ticker> | TKR:<ticker>
+    ticker: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str | None] = mapped_column(String(255))
+    exchange: Mapped[str | None] = mapped_column(String(16))
+    security_type: Mapped[str | None] = mapped_column(String(16))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    currency: Mapped[str | None] = mapped_column(String(8))
+    locale: Mapped[str | None] = mapped_column(String(8))
+    country: Mapped[str | None] = mapped_column(String(16))  # SEC state/country of incorporation when known
+    cik: Mapped[str | None] = mapped_column(String(10))
+    composite_figi: Mapped[str | None] = mapped_column(String(16))
+    share_class_figi: Mapped[str | None] = mapped_column(String(16))
+    sic_code: Mapped[str | None] = mapped_column(String(8))
+    industry: Mapped[str | None] = mapped_column(String(255))
+    sector: Mapped[str | None] = mapped_column(String(64))
+    market_cap: Mapped[float | None] = mapped_column(Float)
+    market_cap_basis: Mapped[str | None] = mapped_column(String(64))
+    provider: Mapped[str] = mapped_column(String(32))
+    provider_updated_at: Mapped[datetime | None] = mapped_column(TS)
+    first_seen_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+    last_seen_at: Mapped[datetime | None] = mapped_column(TS)  # last refresh that listed it as active
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(TS)
+    delisted_at: Mapped[datetime | None] = mapped_column(TS)
+    eligibility_status: Mapped[str] = mapped_column(String(24), default="unscreened")
+    # unscreened | eligible | catalyst_eligible | ineligible | excluded_type | inactive | needs_alt_fundamentals
+    exclusion_reason: Mapped[str | None] = mapped_column(Text)
+    financial_coverage: Mapped[str | None] = mapped_column(String(24))  # sec_full | sec_partial | none | foreign
+    first_eligible_at: Mapped[datetime | None] = mapped_column(TS)
+    screen_metrics: Mapped[Any | None] = mapped_column(JSONB)
+    screened_at: Mapped[datetime | None] = mapped_column(TS)
+    exclusion_codes: Mapped[Any | None] = mapped_column(JSONB)  # every failing eligibility check, not just the first
+    provider_shares: Mapped[float | None] = mapped_column(Float)  # market-data provider share count (Massive)
+    provider_market_cap: Mapped[float | None] = mapped_column(Float)
+    provider_checked_at: Mapped[datetime | None] = mapped_column(TS)
+    company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id", ondelete="SET NULL"))
+
+
+class SecurityTickerHistory(Base):
+    __tablename__ = "security_ticker_history"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    security_id: Mapped[int] = mapped_column(ForeignKey("securities.id", ondelete="CASCADE"), index=True)
+    old_ticker: Mapped[str | None] = mapped_column(String(16))
+    new_ticker: Mapped[str] = mapped_column(String(16))
+    change_type: Mapped[str] = mapped_column(String(24))  # listed | ticker_change | delisted | relisted
+    changed_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
+class SecurityDailyBar(Base):
+    """Lean market-wide daily bars from grouped-daily requests (split-adjusted at fetch time)."""
+
+    __tablename__ = "security_daily_bars"
+    security_id: Mapped[int] = mapped_column(ForeignKey("securities.id", ondelete="CASCADE"), primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float | None] = mapped_column(Float)
+    vwap: Mapped[float | None] = mapped_column(Float)
+
+
+class SecurityFundamentals(Base):
+    """Market-wide screening fundamentals per SEC filer (from XBRL frames), with provenance."""
+
+    __tablename__ = "security_fundamentals"
+    cik: Mapped[str] = mapped_column(String(10), primary_key=True)
+    data_mode: Mapped[str] = mapped_column(String(8), primary_key=True)
+    metrics: Mapped[Any] = mapped_column(JSONB)  # value + period + accession per metric
+    periods: Mapped[Any | None] = mapped_column(JSONB)
+    fetched_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+    # SEC companyfacts fallback (TTM, point-in-time normalizer) for filers the frames API missed
+    fallback: Mapped[Any | None] = mapped_column(JSONB)
+    fallback_fetched_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class MarketSplit(Base):
+    """Market-wide stock splits (Massive /v3/reference/splits) — used to put SEC share counts that
+    pre-date a split on the current share basis when computing market cap."""
+
+    __tablename__ = "market_splits"
+    __table_args__ = (UniqueConstraint("data_mode", "ticker", "execution_date", name="uq_market_split"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    data_mode: Mapped[str] = mapped_column(String(8))
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    execution_date: Mapped[date] = mapped_column(Date)
+    split_from: Mapped[float] = mapped_column(Float)
+    split_to: Mapped[float] = mapped_column(Float)
+    fetched_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
+class FilingIndexDay(Base):
+    """Which SEC daily indexes were ingested (idempotency)."""
+
+    __tablename__ = "filing_index_days"
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    status: Mapped[str] = mapped_column(String(16))  # ingested | no_index
+    filings: Mapped[int | None] = mapped_column(Integer)
+    ingested_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
+# ---------------------------------------------------------------------------------------- AI research chat
+class ChatConversation(Base):
+    """One research conversation about one ticker (separate conversations per ticker; no cross-ticker context)."""
+
+    __tablename__ = "chat_conversations"
+    __table_args__ = (Index("ix_chat_conv_ticker", "data_mode", "ticker", "updated_at"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    data_mode: Mapped[str] = mapped_column(String(8))
+    ticker: Mapped[str] = mapped_column(String(16))
+    company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id", ondelete="SET NULL"))
+    analysis_id: Mapped[int | None] = mapped_column(ForeignKey("analyses.id", ondelete="SET NULL"))  # context in use
+    summary: Mapped[str | None] = mapped_column(Text)  # compact summary of turns older than the history window
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+    cleared_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_conversations.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(16))  # user | assistant | notice
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+    status: Mapped[str] = mapped_column(String(16), default="ok")  # ok | error | partial
+    analysis_id: Mapped[int | None] = mapped_column(ForeignKey("analyses.id", ondelete="SET NULL"))
+    forecast_model_version: Mapped[str | None] = mapped_column(String(32))
+    ai_model: Mapped[str | None] = mapped_column(String(64))
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    cost_usd: Mapped[float | None] = mapped_column(Float)
+    citations: Mapped[Any | None] = mapped_column(JSONB)  # source labels used in the answer
+    scenario: Mapped[Any | None] = mapped_column(JSONB)  # hypothetical what-if result shown with the answer
+    follow_ups: Mapped[Any | None] = mapped_column(JSONB)
+    context_meta: Mapped[Any | None] = mapped_column(JSONB)  # freshness / sections used (audit)
+
+
+class ChatSourceReference(Base):
+    __tablename__ = "chat_source_references"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("chat_messages.id", ondelete="CASCADE"), index=True)
+    label: Mapped[str] = mapped_column(String(16))
+    source_type: Mapped[str] = mapped_column(String(32))
+    title: Mapped[str | None] = mapped_column(Text)
+    url: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[str | None] = mapped_column(String(32))
+    record_ref: Mapped[str | None] = mapped_column(String(64))  # e.g. analysis:412, event:88, accession
+
+
+class ChatToolExecution(Base):
+    __tablename__ = "chat_tool_executions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_conversations.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("chat_messages.id", ondelete="CASCADE"))
+    tool_name: Mapped[str] = mapped_column(String(48))
+    arguments: Mapped[Any | None] = mapped_column(JSONB)
+    result: Mapped[Any | None] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(16))  # ok | rejected | error
+    error: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)

@@ -79,6 +79,22 @@ class ProviderArticle(BaseModel):
     sentiment: dict[str, str] = Field(default_factory=dict)  # vendor-provided, informational only
 
 
+class ListedSecurity(BaseModel):
+    """One row of the provider's ticker reference list."""
+
+    ticker: str
+    name: str | None = None
+    exchange: str | None = None
+    security_type: str | None = None
+    active: bool = True
+    currency: str | None = None
+    locale: str | None = None
+    cik: str | None = None
+    composite_figi: str | None = None
+    share_class_figi: str | None = None
+    last_updated: datetime | None = None
+
+
 class MarketDataProvider(abc.ABC):
     name: str = "abstract"
     is_demo: bool = False
@@ -108,6 +124,14 @@ class MarketDataProvider(abc.ABC):
         """Most recent market-wide news (all tickers), newest first."""
         return []
 
+    def list_securities(self, security_type: str, on_page=lambda n: None) -> list[ListedSecurity]:
+        """All active securities of one type (paginated by the provider)."""
+        return []
+
     def get_grouped_daily(self, day: date) -> dict[str, PriceBar]:
         """All tickers' bars for one session (used for cheap universe-wide refreshes)."""
         return {}
+
+    def list_splits(self, since: date, max_pages: int = 10) -> list[tuple[str, CorporateActionData]]:
+        """Market-wide stock splits executed on/after `since` as (ticker, split)."""
+        return []

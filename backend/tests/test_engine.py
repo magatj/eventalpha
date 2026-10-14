@@ -91,8 +91,16 @@ def test_target_dates_for_all_horizons():
 
 
 def test_blend_weights_pe_and_dcf():
+    """60/40 P/E-DCF blend when the methods agree; DCF weight fades as they diverge (cross-check only >3x)."""
     s = ForecastEngine(inputs()).run(12).scenarios["base"]
-    assert s.target_price == pytest.approx(0.6 * s.target_price_pe + 0.4 * s.target_price_dcf)
+    w = s.details["method_weights"]
+    assert s.target_price == pytest.approx(w["forward_pe"] * s.target_price_pe + w.get("dcf", 0) * s.target_price_dcf, rel=1e-3)
+    ratio = s.details["method_ratio"]
+    expected_dcf = 0.4 * min(1.0, max(0.0, (3.0 - ratio) / 1.5)) if ratio > 1.5 else 0.4
+    assert w.get("dcf", 0) == pytest.approx(expected_dcf / (0.6 + expected_dcf), rel=1e-2)
+    agree = ForecastEngine(inputs(fcf_margin=0.40, margin_history=[])).run(12).scenarios["base"]
+    if agree.details["method_ratio"] <= 1.5:
+        assert agree.details["method_weights"] == {"forward_pe": 0.6, "dcf": 0.4}
 
 
 def test_negative_earnings_fall_back_to_ev_sales():
@@ -162,7 +170,7 @@ def test_terminal_growth_below_discount_rate():
 def test_unstable_fcf_reduces_dcf_weight():
     hist = [{"revenue": 1e9, "net_margin": 0.1, "fcf_margin": m} for m in (-0.1, 0.3, 0.05, 0.2)]
     s = ForecastEngine(inputs(margin_history=hist)).run(12).scenarios["base"]
-    assert s.details["method_weights"]["dcf"] == pytest.approx(0.25 / 0.85, rel=1e-3)
+    assert s.details["method_weights"].get("dcf", 0) <= 0.25 / 0.85 + 1e-9
 
 
 def test_sensitivity_grids_and_volatility_band():
@@ -201,3 +209,7 @@ def test_implausible_valuation_is_withheld_not_shown():
     assert all(s.target_price is None and s.potential_return is None for s in h.scenarios.values())
     assert any("Implausible valuation" in w for w in h.warnings)
     assert h.scenarios["base"].details["withheld_target"] > 1e6
+
+
+def test_broad_business_services_sic_is_not_forced_into_financials():
+    assert sector_from_sic("7389", "SERVICES-BUSINESS SERVICES, NEC") == "Industrials"

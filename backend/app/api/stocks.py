@@ -78,12 +78,15 @@ def stock_overview(ticker: str, db: Session = Depends(get_db), mode: str = Depen
     eps = snap.get("eps_ttm")
     shares = c.shares_outstanding
     mcap = px["price"] * shares if px and shares else c.market_cap
+    basis = "latest close × provider shares outstanding" if px and shares else "provider reported"
+    vmc = ((a.valuation or {}).get("market_cap") or {}) if a else {}
+    if vmc.get("shares") and px:  # SEC current shares outstanding (split-adjusted) from the latest analysis
+        mcap, basis = px["price"] * vmc["shares"], "latest close × SEC shares outstanding"
     return {
         "data_mode": mode, "ticker": c.ticker, "name": c.name, "exchange": c.exchange, "cik": c.cik,
         "sector": c.sector, "industry": c.industry, "fiscal_year_end": c.fiscal_year_end,
         "latest_price": px,
-        "market_cap": {"value": mcap, "provenance": OBSERVED,
-                       "basis": "latest close × shares outstanding" if px and shares else "provider reported"},
+        "market_cap": {"value": mcap, "provenance": OBSERVED, "basis": basis},
         "high_52w": stats.get("high_52w"), "low_52w": stats.get("low_52w"),
         "avg_dollar_volume_20d": stats.get("avg_dollar_volume_20d"), "volatility_1y": stats.get("volatility_1y"),
         "return_1y": stats.get("return_1y"),
@@ -232,7 +235,7 @@ def get_analysis(ticker: str, analysis_id: int | None = None, db: Session = Depe
     srcs = db.scalars(select(AnalysisSource).where(AnalysisSource.analysis_id == a.id)).all()
     return {
         "data_mode": mode, "ticker": c.ticker, "company": c.name, **analysis_summary(a),
-        "thesis": a.thesis, "snapshot": a.snapshot, "warnings": a.warnings or [],
+        "thesis": a.thesis, "snapshot": a.snapshot, "warnings": a.warnings or [], "valuation": a.valuation,
         "prompt_version": a.prompt_version, "usage": a.usage, "cost_usd": a.cost_usd,
         "financial_data_version": a.financial_data_version,
         "sources": sorted([{"label": s.label, "type": s.source.source_type, "title": s.source.title, "url": s.source.url,

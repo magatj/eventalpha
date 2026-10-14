@@ -51,10 +51,30 @@ export function ReturnText({ value, className, digits = 1 }: { value: number | n
 
 const PATHWAY_LABEL: Record<string, [string, string]> = {
   baseline_leader: ["Baseline leader", "Top baseline score (financial strength + data freshness) across the whole universe"],
+  financial_leader: ["Financial leader", "Top market-wide screen for profitability, growth, free cash flow, balance sheet and earnings consistency"],
+  valuation_opportunity: ["Valuation", "Attractive sector-relative earnings / FCF / EBIT yield"],
   new_catalyst: ["New catalyst", "Catalyst first detected since the previous discovery run"],
   underexplored: ["Underexplored", "Never analyzed, or analyzed least recently"],
   refill: ["Refill", "Filled an unused pathway slot from the baseline ranking"],
 };
+
+const VALUATION_STATUS: Record<string, [string, "up" | "warn" | "down" | "default", string]> = {
+  valid: ["Valid valuation", "up", "Supported by company-specific evidence"],
+  limited_data: ["Limited data", "warn", "Usable, but relies on fallbacks (sector reference multiples, short history or missing inputs)"],
+  requires_review: ["Requires review", "down", "The result is not supported by its assumptions; excluded from ranked recommendations"],
+  unsupported_valuation: ["Unsupported valuation", "default", "No suitable valuation method for this business with the available data; no target shown"],
+  invalid_inputs: ["Invalid inputs", "down", "Inconsistent or implausible source data; targets withheld"],
+};
+
+export function ValuationStatusBadge({ status }: { status: string | null | undefined }) {
+  if (!status) return null;
+  const [text, variant, title] = VALUATION_STATUS[status] ?? [status, "default", ""];
+  return (
+    <Badge variant={variant} title={title}>
+      {text}
+    </Badge>
+  );
+}
 
 export function PathwayBadge({ pathway }: { pathway: string | null | undefined }) {
   if (!pathway) return <span className="text-subtle">—</span>;
@@ -128,7 +148,7 @@ export function PriceTag({ p, size = "md" }: { p: LatestPrice | null | undefined
 export function Kpi({ label, value, sub, badge }: { label: string; value: ReactNode; sub?: ReactNode; badge?: ReactNode }) {
   return (
     <div className="rounded-lg border border-border bg-surface-2/60 p-3">
-      <div className="flex items-center justify-between gap-2 text-[11px] uppercase tracking-wide text-subtle">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px] uppercase tracking-wide text-subtle">
         <span>{label}</span>
         {badge}
       </div>
